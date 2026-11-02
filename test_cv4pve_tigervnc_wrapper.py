@@ -257,11 +257,32 @@ class ParseVvTests(unittest.TestCase):
                 self.assert_rejected("\n".join(lines) + "\n", "missing")
 
     def test_reject_unknown_key(self):
+        # Value: protects=unknown keys are rejected and their names echoed only when whitelist-shaped, hostile bytes suppressed; fails_when=the charset gate on echoed names is dropped or the echo is unconditional; why_new=only a whitelist-safe name was exercised, the suppression branch had no test; seam=none; no_claim=none beyond protects
         self.assert_rejected(
             VV_TEMPLATE.format(port=PORT, password=TICKET, title="t")
             + "EnableSmartcard=1\n",
             "unknown key",
         )
+        # A hostile key name (spaces, metacharacters) is withheld, not echoed.
+        self.assert_rejected(
+            VV_TEMPLATE.format(port=PORT, password=TICKET, title="t")
+            + "evil SECRET123;rm -rf = 1\n",
+            "unknown key",
+        )
+        err = io.StringIO()
+        path = write_vv(
+            VV_TEMPLATE.format(port=PORT, password=TICKET, title="t")
+            + "evil SECRET123;rm -rf = 1\n"
+        )
+        try:
+            with contextlib.redirect_stderr(err):
+                rc = w.main([path])
+            self.assertEqual(rc, 2)
+            self.assertNotIn("SECRET123", err.getvalue())
+            self.assertEqual(len(err.getvalue().splitlines()), 1)
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
 
     def test_reject_duplicate_key(self):
         self.assert_rejected(

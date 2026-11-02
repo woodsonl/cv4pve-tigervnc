@@ -97,10 +97,11 @@ status.
 
 Every rejection prints one line starting with `error:` and exits 2, before
 anything is launched; a bad invocation (no argument, or `-h`) prints a `usage:`
-line instead. No message ever quotes the file's contents back at you: a
-rejected connection file may be hostile, so diagnostics name the failed check,
-not the bytes that failed it. The three ticket messages tell you which stage
-broke:
+line instead. Diagnostics name the failed check, not the bytes that failed
+it. Two deliberate exceptions, both bounded: the charset failure reports the
+Unicode code points of rejected characters (never the characters), and the
+unknown-key message echoes key names only when they look like something
+cv4pve-vdi would write. The three ticket messages tell you which stage broke:
 
 | Message | Meaning |
 | --- | --- |
@@ -123,9 +124,10 @@ viewer. So:
   read. The ticket reaches one place, the 0600 password file, and `configparser`
   with `interpolation=None` round-trips every one of them unchanged.
 - The ticket never enters argv, the environment, or any log. The password file
-  holds the 8 obfuscated bytes and nothing else. Rejection messages never quote
-  the file's contents either: diagnostics name the failed check, not the bytes
-  that failed it.
+  holds the 8 obfuscated bytes and nothing else. Diagnostics name the failed
+  check rather than the bytes that failed it, with two bounded exceptions: the
+  charset failure reports code points only, and whitelist-shaped unknown key
+  names are echoed.
 - `VNC_PASSWORD` and `VNC_USERNAME` are stripped from the child environment.
   TigerVNC prefers those over `-passwd`, so a stale value would silently beat
   the ticket.
@@ -163,7 +165,7 @@ The DES tables and round function are transcribed from TigerVNC's
 > This is D3DES (V5.09) by Richard Outerbridge with the double and
 > triple-length support removed for use in VNC. Also the bytebit[] array
 > has been reversed so that the most significant bit in each byte of the
-> key is ignored, not the least.
+> key is ignored, not the least significant.
 >
 > These changes are: Copyright (C) 1999 AT&T Laboratories Cambridge.
 > All Rights Reserved.
