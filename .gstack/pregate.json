@@ -2,9 +2,15 @@
   "$schema": "https://github.com/garrytan/gstack/docs/pregate.md#pregate-v1",
   "runner": "/usr/bin/python3 -m unittest {files}",
   "dependencies": {
-    "cv4pve_tigervnc_wrapper.py": ["test_cv4pve_tigervnc_wrapper.py"],
-    "ruff.toml": ["test_cv4pve_tigervnc_wrapper.py"],
-    ".github/workflows/ci.yml": ["test_cv4pve_tigervnc_wrapper.py"]
+    "cv4pve_tigervnc_wrapper.py": [
+      "test_cv4pve_tigervnc_wrapper.py"
+    ],
+    "ruff.toml": [
+      "test_cv4pve_tigervnc_wrapper.py"
+    ],
+    ".github/workflows/ci.yml": [
+      "test_cv4pve_tigervnc_wrapper.py"
+    ]
   },
   "empty_lanes": [],
   "selection": {},
@@ -20,8 +26,11 @@
   "allowlist": [
     {
       "finding": "env.kv",
-      "paths": ["test_cv4pve_tigervnc_wrapper.py"],
-      "reason": "the .vv fixture template's password= placeholder line, not a credential; this repo's entire subject is obfuscating one-time PVE tickets, so its test fixtures are password-shaped by construction"
+      "paths": [
+        "test_cv4pve_tigervnc_wrapper.py"
+      ],
+      "reason": "the .vv fixture template's password= placeholder line only (pattern-anchored); a real credential pasted into this file must still fail",
+      "pattern": "\\{password\\}"
     }
   ]
 }
