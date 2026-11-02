@@ -52,8 +52,15 @@ VIEWER_ENV_OVERRIDE = "CV4PVE_TIGERVNC_VIEWER"
 # of the password (TigerVNC common/rfb/obfuscate.cxx, d3desObfuscationKey).
 _OBFUSCATION_KEY = bytes((23, 82, 107, 6, 35, 78, 88, 7))
 
-# PVE tickets are base64ish with ':' separators and '@'/'!' in usernames.
-_TICKET_RE = re.compile(r"^[A-Za-z0-9+/=:_@!.-]{1,4096}$")
+# What PVE puts in password= for a websocket console (PVE::API2 vncproxy/vncshell):
+#   "<pw>:PVEVNC:<hex-ts>:<user>:<path>:<port>::<base64 RSA sig>"
+# where <pw> is 8 random bytes from ord('!')..ord('`') (PVE::Ticket::generate_vnc_password)
+# and the API documents the whole value as printable ASCII '!'..'~'. So the
+# whitelist is exactly that range: printable ASCII, which still excludes every
+# space, control, and high-byte character. The RSA signature is standard
+# base64 (MIME::Base64: A-Za-z0-9+/=), so no character outside the range appears.
+_TICKET_CHAR_RE = re.compile(r"[\x21-\x7e]")
+_TICKET_RE = re.compile(r"^[\x21-\x7e]{1,4096}$")
 _PORT_RE = re.compile(r"^[0-9]{1,5}$")
 _TITLE_RE = re.compile(r"^[ -~]{1,200}$")
 
@@ -457,8 +464,18 @@ def parse_vv(path):
         raise VvError(f"invalid port {port!r}")
 
     password = get("password")
+    if not password:
+        raise VvError(
+            "password= is empty: cv4pve-vdi got no VNC ticket from PVE. Check "
+            "that the PVE user holds VM.Console (plus VM.Audit) on this guest, "
+            "and that the guest is running"
+        )
     if not _TICKET_RE.match(password):
-        raise VvError("password (VNC ticket) failed charset validation")
+        bad = sorted({ord(c) for c in password if not _TICKET_CHAR_RE.match(c)})
+        shown = " ".join(f"U+{c:04X}" for c in bad[:12])
+        raise VvError(
+            f"password (VNC ticket) has {len(bad)} unexpected character(s): {shown}"
+        )
 
     if "title" in keys and not _TITLE_RE.match(get("title")):
         raise VvError("title failed charset validation")
