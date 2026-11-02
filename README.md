@@ -111,7 +111,9 @@ cv4pve-vdi would write. The three ticket messages tell you which stage broke:
 
 The rest fail closed on the file itself: unknown or duplicate keys, a second
 section, a `[DEFAULT]` section, `type` other than `vnc`, `host` other than
-`127.0.0.1`, a port outside 1-65535, and a `.vv` over 4096 bytes.
+`127.0.0.1`, a port outside 1-65535, a `title` that is not 1-200 printable
+ASCII characters, a `delete-this-file` value other than `1`, a file that is
+not valid UTF-8 or not valid INI, and a `.vv` over 4096 bytes.
 
 ## Why it checks so much of the file
 
