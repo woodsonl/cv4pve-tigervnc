@@ -76,7 +76,7 @@ class VvError(Exception):
 # --------------------------------------------------------------------------
 # DES, ported line-by-line from TigerVNC common/rfb/d3des.c. This is NOT
 # textbook DES: d3des reverses its bytebit[] table "so that the most
-# significant bit in each byte of the key is ignored, not the least" — VNC
+# significant bit in each byte of the key is ignored, not the least". VNC
 # consumes key bytes LSB-first and discards the DES parity bit. Equivalently,
 # des_vnc(block, key) == standard_des(block, bit_reverse_each_byte(key)).
 # Cross-checks in test_cv4pve_tigervnc_wrapper.py: openssl enc -des-ecb with
@@ -89,7 +89,7 @@ _M32 = 0xFFFFFFFF
 
 # Transcribed mechanically from TigerVNC common/rfb/d3des.c (d3des V5.09 by
 # Richard Outerbridge); the implementation is validated in the test suite
-# against LibreSSL-ECB and d3des.c's own validation vectors.
+# against openssl enc -des-ecb and d3des.c's own validation vectors.
 _BYTEBIT = (
     1, 2, 4, 8, 16, 32, 64, 128,
 )

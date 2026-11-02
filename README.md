@@ -97,8 +97,8 @@ section, a `[DEFAULT]` section, `type` other than `vnc`, `host` other than
 
 ## Why it checks so much of the file
 
-cv4pve-vdi hands this script a file that a Proxmox API response shaped, and the
-script runs a viewer with it. So:
+The `.vv` is written from a Proxmox API response, and this script feeds it to a
+viewer. So:
 
 - The viewer starts from a list argv. No shell, no `eval`, no `shell=True`, so
   nothing in the file can become command syntax. Printable ASCII `!` through
@@ -119,9 +119,31 @@ script runs a viewer with it. So:
 python3 -m unittest test_cv4pve_tigervnc_wrapper
 ```
 
-35 tests, no network and no real viewer; the launch is mocked. The DES port is
-checked against the vector in TigerVNC's `d3des.c` and against
-`openssl enc -des-ecb`. TigerVNC's DES reverses the bit order of each key byte
-and ignores the high bit, so a textbook-DES oracle disagrees with it. The
-equivalence `des_vnc(block, key) == std_des(block, bitrev_each_byte(key))` is
-asserted in both directions.
+35 tests, no network, and TigerVNC is never started. `find_viewer` is patched
+out except in one test that runs `main()` against a `/bin/sh` stub which records
+its argv and exits 7, checking that the wrapper waits for the child, passes the
+exit code up, and leaves no password file behind.
+
+The DES port is checked against the vector documented in TigerVNC's `d3des.c`
+(`c95744256a5ed31d`) and cross-checked against `openssl enc -des-ecb`, which the
+test skips if this machine's OpenSSL has no DES. TigerVNC's DES consumes each key
+byte least-significant-bit-first and ignores the high bit, so a textbook-DES
+oracle disagrees with it. The equivalence
+`des_vnc(block, key) == std_des(block, bitrev_each_byte(key))` is asserted both
+ways.
+
+## Provenance
+
+The DES tables and round function are transcribed from TigerVNC's
+`common/rfb/d3des.c`. That file is Richard Outerbridge's D3DES V5.09, marked
+public domain in its own header, reduced to single-length DES by AT&T
+Laboratories Cambridge with the `bytebit[]` table reversed. The AT&T changes
+carry a copyright line and a warranty disclaimer, not a copyleft grant, so the
+port can sit here under whatever license this repo picks. TigerVNC itself is
+GPLv2; nothing from outside `d3des.c` was taken, and the viewer is a separate
+process this script only execs.
+
+Everything else was written for this repo. `.vv` field names and the ticket
+format come from reading `Corsinvest/cv4pve-api-dotnet`
+`RemoteViewerHelper.CreateVncWebSocketBridgeAsync` and `PVE::API2::Nodes.pm` at
+the versions named above.

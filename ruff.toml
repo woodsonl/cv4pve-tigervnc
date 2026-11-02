@@ -1,4 +1,7 @@
-target-version = "py311"
+# py39, not py311: cv4pve-vdi execs this with whatever /usr/bin/python3 is, and
+# on macOS that is Apple's 3.9.6. Targeting newer lets ruff suggest syntax the
+# launching interpreter cannot parse.
+target-version = "py39"
 line-length = 132
 
 [lint]
