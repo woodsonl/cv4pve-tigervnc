@@ -178,10 +178,12 @@ The DES tables and round function are transcribed from TigerVNC's
 Outerbridge's implementation is public domain by its own statement. The AT&T
 Cambridge reduction is not covered by that grant: it carries its own copyright
 line and "All Rights Reserved", with a warranty disclaimer and no copyleft
-terms. It is reproduced here exactly as the VNC ecosystem has distributed it
-since 1999, alongside this repo's MIT license on everything else. TigerVNC
-itself is GPLv2; nothing from outside `d3des.c` was taken, and the viewer is a
-separate process this script only execs.
+terms. The encryption half is transcribed unchanged from the file the VNC
+ecosystem has distributed since 1999; the decryption half is omitted as
+unneeded. That code sits alongside this repo's MIT license on everything else.
+TigerVNC itself is GPLv2; outside `d3des.c`, the only thing taken from it is
+the fixed 8-byte obfuscation key its `common/rfb/obfuscate.cxx` defines, and
+the viewer is a separate process this script only execs.
 
 Everything else was written for this repo. `.vv` field names and the ticket
 format come from reading `Corsinvest/cv4pve-api-dotnet`
