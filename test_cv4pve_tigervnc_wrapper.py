@@ -13,6 +13,7 @@ Run: /usr/bin/python3 test_cv4pve_tigervnc_wrapper.py
 import contextlib
 import io
 import os
+import shutil
 import signal
 import stat
 import subprocess
@@ -28,7 +29,17 @@ import cv4pve_tigervnc_wrapper as w
 # tempdir, and a shared one fails whenever another suite run or a live wrapper
 # session holds a password file at that moment. Subprocess-based tests pass
 # this dir to the child explicitly (tempfile.tempdir does not cross exec).
-tempfile.tempdir = tempfile.mkdtemp(prefix="cv4pve-tigervnc-tests-")
+_PRIOR_TEMPDIR = tempfile.tempdir
+_TESTS_TMP = tempfile.mkdtemp(prefix="cv4pve-tigervnc-tests-")
+
+
+def _cleanup_tests_tmp():
+    tempfile.tempdir = _PRIOR_TEMPDIR
+    shutil.rmtree(_TESTS_TMP, ignore_errors=True)
+
+
+unittest.addModuleCleanup(_cleanup_tests_tmp)
+tempfile.tempdir = _TESTS_TMP
 
 VV_TEMPLATE = (
     "[virt-viewer]\n"
@@ -304,6 +315,13 @@ class ParseVvTests(unittest.TestCase):
             "DEFAULT",
         )
 
+    def test_reject_empty_default_section(self):
+        # Value: protects=an empty [DEFAULT] header is rejected even though it contributes no defaults and never reaches the sections list; fails_when=the DEFAULT check relies on defaults() alone; why_new=the header-only corner passed silently; seam=none; no_claim=none beyond protects
+        self.assert_rejected(
+            "[DEFAULT]\n" + VV_TEMPLATE.format(port=PORT, password=TICKET, title="t"),
+            "DEFAULT",
+        )
+
     def test_reject_not_ini(self):
         self.assert_rejected("garbage not ini at all\n", "not valid INI")
 
@@ -536,6 +554,19 @@ class LaunchTests(unittest.TestCase):
         vv_path = valid_vv()
         with mock.patch.dict(os.environ, {w.VIEWER_ENV_OVERRIDE: stub}):
             self.assertEqual(w.main([vv_path]), 137)
+
+    def test_mkstemp_failure_exits_2_one_line(self):
+        # Value: protects=a failed password-file creation exits 2 with one error line, not a traceback; fails_when=mkstemp sits outside the error handling; why_new=the no-space-left path was unhandled and every prior launch test reached mkstemp successfully; seam=none; no_claim=real filesystem exhaustion, one mocked errno only
+        vv_path = valid_vv()
+        err = io.StringIO()
+        with mock.patch.object(w.tempfile, "mkstemp", side_effect=OSError(28, "No space left on device")), \
+                contextlib.redirect_stderr(err):
+            rc = w.main([vv_path])
+        self.assertEqual(rc, 2)
+        self.assertEqual(len(err.getvalue().splitlines()), 1)
+        self.assertIn("cannot create password file", err.getvalue())
+        residue = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(".pve-vnc-passwd-")]
+        self.assertEqual(residue, [])
 
     def test_real_launch_with_stub_viewer(self):
         """End-to-end through main() with a stub viewer that prints its argv

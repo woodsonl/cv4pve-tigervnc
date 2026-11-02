@@ -432,6 +432,10 @@ def parse_vv(path):
 
     if cp.defaults():
         raise VvError("unexpected [DEFAULT] section in connection file")
+    # An empty [DEFAULT] header contributes no defaults, so also reject the
+    # header itself: the file must be exactly the one section, nothing else.
+    if re.search(r"(?m)^\s*\[DEFAULT\]\s*$", text):
+        raise VvError("unexpected [DEFAULT] section in connection file")
 
     sections = cp.sections()
     if sections != ["virt-viewer"]:
@@ -543,7 +547,14 @@ def main(argv):
         sys.stderr.write(f"error: {exc}\n")
         return 2
 
-    fd, passwd_file = tempfile.mkstemp(prefix=".pve-vnc-passwd-", suffix=".bin")
+    # Outside the launch try: a failed mkstemp must exit 2 with one error
+    # line like every other failure, and passwd_file must not exist for the
+    # finally below to unlink.
+    try:
+        fd, passwd_file = tempfile.mkstemp(prefix=".pve-vnc-passwd-", suffix=".bin")
+    except OSError as exc:
+        sys.stderr.write(f"error: cannot create password file: {exc}\n")
+        return 2
     try:
         # fdopen closes the descriptor on every path out of this block; a raw
         # os.close would leak it if the launch below raised first.
@@ -563,8 +574,12 @@ def main(argv):
         sys.stderr.write(f"error: failed to launch viewer: {exc}\n")
         return 2
     finally:
-        with contextlib.suppress(OSError):
+        # The password file is the one secret-bearing artifact; a failed
+        # unlink here (not the .vv's best-effort delete) is worth saying.
+        try:
             os.unlink(passwd_file)
+        except OSError as exc:
+            sys.stderr.write(f"warning: could not delete password file: {exc}\n")
 
 
 def _install_sigterm_handler():

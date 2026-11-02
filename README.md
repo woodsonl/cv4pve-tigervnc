@@ -142,7 +142,7 @@ viewer. So:
 python3 -m unittest test_cv4pve_tigervnc_wrapper
 ```
 
-44 tests, no network, and TigerVNC is never started: `main()` is driven
+46 tests, no network, and TigerVNC is never started: `main()` is driven
 end to end against `/bin/sh` stubs. One stub records the password file's bytes
 and mode, proving the file holds exactly `vncpasswd_obfuscate(ticket)` and
 nothing else; another exits 7 to prove the child's exit code passes through;
@@ -175,11 +175,13 @@ The DES tables and round function are transcribed from TigerVNC's
 > A portable, public domain, version of the Data Encryption Standard.
 > Copyright (c) 1988,1989,1990,1991,1992 by Richard Outerbridge.
 
-Outerbridge's implementation is public domain by its own statement, and the
-AT&T Cambridge reduction carries a copyright line and a warranty disclaimer,
-not a copyleft grant, so the port sits here under this repo's MIT license.
-TigerVNC itself is GPLv2; nothing from outside `d3des.c` was taken, and the
-viewer is a separate process this script only execs.
+Outerbridge's implementation is public domain by its own statement. The AT&T
+Cambridge reduction is not covered by that grant: it carries its own copyright
+line and "All Rights Reserved", with a warranty disclaimer and no copyleft
+terms. It is reproduced here exactly as the VNC ecosystem has distributed it
+since 1999, alongside this repo's MIT license on everything else. TigerVNC
+itself is GPLv2; nothing from outside `d3des.c` was taken, and the viewer is a
+separate process this script only execs.
 
 Everything else was written for this repo. `.vv` field names and the ticket
 format come from reading `Corsinvest/cv4pve-api-dotnet`
