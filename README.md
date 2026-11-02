@@ -74,6 +74,11 @@ VncAuth secret, which is what TigerVNC needs. The steps:
    ephemeral, so it has to be the port form.
 5. Wait for the viewer, then delete the password file.
 
+One gap no process can close: a `SIGKILL` between launch and exit skips the
+cleanup and leaves the 8 obfuscated bytes on disk. They are mode 0600, and the
+ticket they encode is one-time and already spent, so the file is worth nothing
+once the session is over. `kill -TERM` and normal exit are both covered.
+
 The wrapper has to stay alive for the whole session. cv4pve-vdi's
 `RemoteViewerService` disposes the bridge when the process it launched exits,
 so a wrapper that exits after spawning the viewer would take the console down
