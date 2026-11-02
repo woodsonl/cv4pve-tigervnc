@@ -1,0 +1,18 @@
+target-version = "py311"
+line-length = 132
+
+[lint]
+# The security-relevant parts read as prose: each guard is a sentence saying
+# what it refuses. E501 is off because breaking those lines is what would hurt
+# them.
+ignore = ["E501"]
+select = [
+  "E4", "E7", "E9", "F",     # pycodestyle errors and pyflakes: correctness
+  "W",                        # pycodestyle warnings (E501 ignored above)
+  "UP",                       # modern Python
+  "BLE",                      # bare `except Exception` must be deliberate and commented
+  "PLW",                      # pylint warnings: subprocess without check=, useless lambdas
+  "C4",                       # comprehension form
+  "RSE",                      # raise from, so a wrapped failure keeps its cause
+  "SIM",                      # simpler forms where the meaning is unchanged
+]

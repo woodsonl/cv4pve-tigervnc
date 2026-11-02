@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Offline tests for cv4pve_tigervnc_wrapper.py — no viewer, no network, no PVE.
+
+DES vectors are ground truth captured from TigerVNC's own d3des semantics:
+VNC d3des consumes key bytes LSB-first (the reversed bytebit[] table), so a
+vector can be re-derived independently as standard DES over bit-reversed key
+bytes, e.g. via /usr/bin/openssl enc -des-ecb -K <bitrev-key> -nosalt -nopad.
+The d3des.c documented vector c95744256a5ed31d is included in VNC form.
+
+Run: /usr/bin/python3 test_cv4pve_tigervnc_wrapper.py
+"""
+
+import os
+import stat
+import subprocess
+import tempfile
+import unittest
+from unittest import mock
+
+import cv4pve_tigervnc_wrapper as w
+
+VV_TEMPLATE = (
+    "[virt-viewer]\n"
+    "type=vnc\n"
+    "host=127.0.0.1\n"
+    "port={port}\n"
+    "password={password}\n"
+    "title={title}\n"
+    "delete-this-file=1\n"
+)
+
+# Real-shaped PVE ticket (charset matches PVE output; value is synthetic).
+TICKET = "PVEVNC:tiger@qemu!1130c32b1c61c8fec1a1e2f50f531eee"
+PORT = 5900
+
+
+def write_vv(body):
+    fd, path = tempfile.mkstemp(suffix=".vv")
+    with os.fdopen(fd, "w") as fh:
+        fh.write(body)
+    return path
+
+
+def valid_vv(**overrides):
+    body = VV_TEMPLATE.format(
+        port=overrides.get("port", PORT),
+        password=overrides.get("password", TICKET),
+        title=overrides.get("title", "test-vm"),
+    )
+    if "delete" in overrides and not overrides["delete"]:
+        body = body.replace("delete-this-file=1\n", "")
+    return write_vv(body)
+
+
+class DesTests(unittest.TestCase):
+    """Vectors in VNC form: d3des with the fixed VNC obfuscation key."""
+
+    KEY = bytes((23, 82, 107, 6, 35, 78, 88, 7))
+
+    def assert_vnc_des(self, block8, want_hex):
+        self.assertEqual(w.des_block(block8, self.KEY), bytes.fromhex(want_hex))
+
+    def test_zero_block(self):
+        self.assert_vnc_des(bytes(8), "5ab2cdc0badcaf13")
+
+    def test_abc(self):
+        self.assert_vnc_des(b"abc".ljust(8, b"\0"), "9c0a172d3482e122")
+
+    def test_12345678(self):
+        self.assert_vnc_des(b"12345678", "f0e43164f6c2e373")
+
+    def test_pve_ticket_shape(self):
+        self.assert_vnc_des(b"PVEVNC:t", "55251e1bc3a8c178")
+
+    def test_aaa_truncates_at_8(self):
+        self.assert_vnc_des(b"A" * 8, "cdf730992d585997")
+
+    def test_d3des_validation_vector(self):
+        # d3des.c documents Key 0123456789abcdef, Plain 0123456789abcde7,
+        # Cipher c95744256a5ed31d under standard bit order; TigerVNC's
+        # reversed bytebit[] reproduces it via the per-byte reversed key.
+        got = w.des_block(
+            bytes.fromhex("0123456789abcde7"),
+            bytes.fromhex("80c4a2e691d5b3f7"),
+        )
+        self.assertEqual(got, bytes.fromhex("c95744256a5ed31d"))
+
+    def test_openssl_cross_check(self):
+        # Re-derive one vector live as standard DES over bit-reversed key
+        # bytes (skip if LibreSSL is unavailable or refuses DES).
+        rev = bytes(
+            int(f"{b:08b}"[::-1], 2) for b in self.KEY
+        )
+        try:
+            proc = subprocess.run(
+                ["/usr/bin/openssl", "enc", "-des-ecb", "-K", rev.hex(),
+                 "-nosalt", "-nopad"],
+                input=b"12345678", capture_output=True, check=True,
+            )
+        except (OSError, subprocess.SubprocessError):
+            self.skipTest("openssl DES unavailable")
+        self.assertEqual(proc.stdout.hex(), w.des_block(b"12345678", self.KEY).hex())
+
+    def test_obfuscate_truncates_and_pads(self):
+        # vncpasswd semantics: only the first 8 bytes matter; VncAuth itself
+        # reads exactly 8 bytes back.
+        a8 = w.vncpasswd_obfuscate("A" * 8)
+        a20 = w.vncpasswd_obfuscate("A" * 20)
+        self.assertEqual(a8, a20)
+        self.assertEqual(a8, bytes.fromhex("cdf730992d585997"))
+        empty = w.vncpasswd_obfuscate("")
+        self.assertEqual(empty, bytes.fromhex("5ab2cdc0badcaf13"))
+
+    def test_obfuscate_utf8(self):
+        # Non-ASCII passwords truncate to their UTF-8 first 8 bytes.
+        self.assertEqual(
+            w.vncpasswd_obfuscate("ààààà"),
+            w.vncpasswd_obfuscate("ààààà".encode()[:8].decode("utf-8", "ignore")),
+        )
+
+
+class ParseVvTests(unittest.TestCase):
+    def test_valid_vv(self):
+        path = valid_vv()
+        try:
+            port, password = w.parse_vv(path)
+            self.assertEqual(port, PORT)
+            self.assertEqual(password, TICKET)
+            self.assertFalse(os.path.exists(path), ".vv must be deleted after parse")
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_valid_without_optional_keys(self):
+        body = (
+            "[virt-viewer]\n"
+            "type=vnc\n"
+            "host=127.0.0.1\n"
+            "port=5901\n"
+            "password=abc\n"
+        )
+        path = write_vv(body)
+        try:
+            port, _ = w.parse_vv(path)
+            self.assertEqual(port, 5901)
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def assert_rejected(self, body, exc_fragment=None):
+        path = write_vv(body)
+        try:
+            with self.assertRaises(w.VvError) as ctx:
+                w.parse_vv(path)
+            if exc_fragment:
+                self.assertIn(exc_fragment, str(ctx.exception))
+            # Even a rejected file leaves nothing on disk after parsing.
+            self.assertFalse(os.path.exists(path))
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_reject_spice(self):
+        self.assert_rejected(
+            VV_TEMPLATE.format(port=PORT, password=TICKET, title="t")
+            .replace("type=vnc", "type=spice"),
+            "only VNC",
+        )
+
+    def test_reject_non_localhost(self):
+        body = VV_TEMPLATE.format(port=PORT, password=TICKET, title="t").replace(
+            "host=127.0.0.1", "host=192.168.1.10"
+        )
+        self.assert_rejected(body, "non-localhost")
+
+    def test_reject_bad_port(self):
+        for bad in ("", "0", "65536", "5900x", "-1"):
+            body = VV_TEMPLATE.format(port=bad, password=TICKET, title="t")
+            with self.subTest(bad=bad):
+                self.assert_rejected(body, "port")
+        # A value with an embedded newline breaks the INI structure itself;
+        # still rejected, just by the INI layer.
+        self.assert_rejected(VV_TEMPLATE.format(port="5900\n5901", password=TICKET, title="t"))
+
+    def test_reject_hostile_ticket(self):
+        for bad in ("with spaces", "with\nnewline", "shell;injection", "a`b`c", "$(x)"):
+            with self.subTest(bad=bad):
+                self.assert_rejected(
+                    VV_TEMPLATE.format(port=PORT, password=bad, title="t")
+                )
+
+    def test_reject_missing_required_key(self):
+        for key in ("type", "host", "port", "password"):
+            body = VV_TEMPLATE.format(port=PORT, password=TICKET, title="t")
+            lines = [ln for ln in body.splitlines() if not ln.startswith(f"{key}=")]
+            with self.subTest(key=key):
+                self.assert_rejected("\n".join(lines) + "\n", "missing")
+
+    def test_reject_unknown_key(self):
+        self.assert_rejected(
+            VV_TEMPLATE.format(port=PORT, password=TICKET, title="t")
+            + "EnableSmartcard=1\n",
+            "unknown key",
+        )
+
+    def test_reject_duplicate_key(self):
+        self.assert_rejected(
+            VV_TEMPLATE.format(port=PORT, password=TICKET, title="t")
+            + "password=second\n",
+        )
+
+    def test_reject_extra_section(self):
+        self.assert_rejected(
+            VV_TEMPLATE.format(port=PORT, password=TICKET, title="t")
+            + "[spice]\nhost=127.0.0.1\n",
+        )
+
+    def test_reject_default_section(self):
+        self.assert_rejected(
+            "[DEFAULT]\nhost=127.0.0.1\n"
+            + VV_TEMPLATE.format(port=PORT, password=TICKET, title="t"),
+            "DEFAULT",
+        )
+
+    def test_reject_not_ini(self):
+        self.assert_rejected("garbage not ini at all\n")
+
+    def test_reject_huge_file(self):
+        self.assert_rejected("x" * (w._VV_MAX_BYTES + 1), "implausibly large")
+
+    def test_reject_missing_file(self):
+        with self.assertRaises(w.VvError):
+            w.parse_vv("/nonexistent/path.vv")
+
+    def test_reject_invalid_utf8(self):
+        fd, path = tempfile.mkstemp(suffix=".vv")
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(b"[virt-viewer]\npassword=\xff\xfe\n")
+        try:
+            with self.assertRaises(w.VvError):
+                w.parse_vv(path)
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+
+class LaunchTests(unittest.TestCase):
+    def test_viewer_missing_fails_closed(self):
+        with mock.patch.dict(os.environ, {w.VIEWER_ENV_OVERRIDE: "/nonexistent/vncviewer"}), \
+                mock.patch.object(w, "find_viewer", wraps=w.find_viewer), \
+                self.assertRaises(w.VvError):
+            w.find_viewer()
+
+    def test_build_viewer_argv(self):
+        argv = w.build_viewer_argv("/vncviewer", "/tmp/pw.bin", 5900)
+        self.assertEqual(argv[0], "/vncviewer")
+        self.assertEqual(argv[1], "-passwd")
+        self.assertIn("/tmp/pw.bin", argv)
+        self.assertEqual(argv[-1], "127.0.0.1::5900")
+        self.assertIn("-SecurityTypes", argv)
+
+    def test_env_stripped(self):
+        with mock.patch.dict(os.environ, {"VNC_PASSWORD": "stale", "VNC_USERNAME": "bob"}):
+            env = w.child_env()
+            self.assertNotIn("VNC_PASSWORD", env)
+            self.assertNotIn("VNC_USERNAME", env)
+            self.assertIn("PATH", env)  # rest of env preserved
+
+    def test_passwd_file_cleaned_up_on_launch_failure(self):
+        vv_path = valid_vv()
+        with mock.patch.dict(os.environ, {w.VIEWER_ENV_OVERRIDE: "/nonexistent/vncviewer"}):
+            rc = w.main([vv_path])
+        self.assertEqual(rc, 2)
+        self.assertFalse(os.path.exists(vv_path))
+        # No password file residue in the temp dir.
+        residue = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(".pve-vnc-passwd-")]
+        self.assertEqual(residue, [])
+
+    def test_main_rejects_wrong_argc(self):
+        self.assertEqual(w.main([]), 2)
+        self.assertEqual(w.main(["a.vv", "b.vv"]), 2)
+
+    def test_main_reports_bad_vv(self):
+        path = write_vv("type=spice\n")
+        try:
+            rc = w.main([path])
+            self.assertEqual(rc, 2)
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_real_launch_with_stub_viewer(self):
+        """End-to-end through main() with a stub viewer that prints its argv
+        (minus the password file path) and exits 7; verifies the wrapper
+        launches, waits, and cleans up."""
+        argv_log = os.path.join(tempfile.mkdtemp(), "argv")
+        stub = os.path.join(tempfile.mkdtemp(), "stub_viewer")
+        with open(stub, "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                f'for a in "$@"; do case "$a" in -passwd) ;; '
+                f'*.bin) ;; *) printf "%s\\n" "$a" >> {argv_log} ;; esac; done\n'
+                "exit 7\n"
+            )
+        os.chmod(stub, stat.S_IRWXU)
+        vv_path = valid_vv()
+        with mock.patch.dict(os.environ, {w.VIEWER_ENV_OVERRIDE: stub}):
+            rc = w.main([vv_path])
+        self.assertEqual(rc, 7)  # wrapper waited for the child and passed rc up
+        with open(argv_log) as fh:
+            self.assertEqual(fh.read().split(), ["-SecurityTypes", "VncAuth", f"127.0.0.1::{PORT}"])
+        self.assertFalse(os.path.exists(vv_path))
+        residue = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(".pve-vnc-passwd-")]
+        self.assertEqual(residue, [])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
