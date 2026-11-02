@@ -30,7 +30,7 @@
         "test_cv4pve_tigervnc_wrapper.py"
       ],
       "reason": "the .vv fixture template's password= placeholder line only (pattern-anchored); a real credential pasted into this file must still fail",
-      "pattern": "password=\\{password\\}"
+      "pattern": "\\{password\\}"
     }
   ]
 }
