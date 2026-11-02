@@ -354,15 +354,6 @@ def _desfunc(block, keys):
     return right, leftt
 
 
-_SCHEDULE_CACHE = {}
-
-
-def _fixed_schedule():
-    if "sched" not in _SCHEDULE_CACHE:
-        _SCHEDULE_CACHE["sched"] = _cookey(_deskey(_OBFUSCATION_KEY))
-    return _SCHEDULE_CACHE["sched"]
-
-
 def des_block(block8, key8):
     """DES-encrypt one 8-byte block with an 8-byte key; returns 8 bytes."""
     words = (
