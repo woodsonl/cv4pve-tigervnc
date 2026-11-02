@@ -558,8 +558,13 @@ class LaunchTests(unittest.TestCase):
     def test_mkstemp_failure_exits_2_one_line(self):
         # Value: protects=a failed password-file creation exits 2 with one error line, not a traceback; fails_when=mkstemp sits outside the error handling; why_new=the no-space-left path was unhandled and every prior launch test reached mkstemp successfully; seam=none; no_claim=real filesystem exhaustion, one mocked errno only
         vv_path = valid_vv()
+        stub = os.path.join(tempfile.mkdtemp(), "stub_viewer")
+        with open(stub, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(stub, stat.S_IRWXU)
         err = io.StringIO()
-        with mock.patch.object(w.tempfile, "mkstemp", side_effect=OSError(28, "No space left on device")), \
+        with mock.patch.dict(os.environ, {w.VIEWER_ENV_OVERRIDE: stub}), \
+                mock.patch.object(w.tempfile, "mkstemp", side_effect=OSError(28, "No space left on device")), \
                 contextlib.redirect_stderr(err):
             rc = w.main([vv_path])
         self.assertEqual(rc, 2)
