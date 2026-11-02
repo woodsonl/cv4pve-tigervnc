@@ -537,9 +537,10 @@ def main(argv):
 
     fd, passwd_file = tempfile.mkstemp(prefix=".pve-vnc-passwd-", suffix=".bin")
     try:
-        os.fchmod(fd, 0o600)
-        os.write(fd, vncpasswd_obfuscate(password))
-        os.close(fd)
+        # fdopen closes the descriptor on every path out of this block; a raw
+        # os.close would leak it if the launch below raised first.
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(vncpasswd_obfuscate(password))
         proc = subprocess.Popen(
             build_viewer_argv(viewer, passwd_file, port),
             env=child_env(),
