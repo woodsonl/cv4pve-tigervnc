@@ -10,14 +10,25 @@ The d3des.c documented vector c95744256a5ed31d is included in VNC form.
 Run: /usr/bin/python3 test_cv4pve_tigervnc_wrapper.py
 """
 
+import contextlib
+import io
 import os
+import signal
 import stat
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
 import cv4pve_tigervnc_wrapper as w
+
+# A private temp dir keeps the residue assertions honest: they scan the whole
+# tempdir, and a shared one fails whenever another suite run or a live wrapper
+# session holds a password file at that moment. Subprocess-based tests pass
+# this dir to the child explicitly (tempfile.tempdir does not cross exec).
+tempfile.tempdir = tempfile.mkdtemp(prefix="cv4pve-tigervnc-tests-")
 
 VV_TEMPLATE = (
     "[virt-viewer]\n"
@@ -262,6 +273,7 @@ class ParseVvTests(unittest.TestCase):
         self.assert_rejected(
             VV_TEMPLATE.format(port=PORT, password=TICKET, title="t")
             + "[spice]\nhost=127.0.0.1\n",
+            "expected exactly one [virt-viewer] section",
         )
 
     def test_reject_default_section(self):
@@ -272,7 +284,26 @@ class ParseVvTests(unittest.TestCase):
         )
 
     def test_reject_not_ini(self):
-        self.assert_rejected("garbage not ini at all\n")
+        self.assert_rejected("garbage not ini at all\n", "not valid INI")
+
+    def test_reject_not_ini_leaks_no_file_bytes(self):
+        # Regression: configparser's own error text quotes the offending raw
+        # line, so a malformed .vv used to print the ticket itself to stderr
+        # and the failure spanned several lines.
+        # Value: protects=a rejected file's bytes never reach stderr and the failure is one error: line; fails_when=an INI exception or file value is interpolated into a message; why_new=every prior assertion was a startswith prefix that multi-line secret-leaking output satisfied; seam=none; no_claim=none beyond protects
+        body = "password=SECRET123:PVEVNC:deadbeef\n"
+        path = write_vv(body)
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = w.main([path])
+            self.assertEqual(rc, 2)
+            self.assertNotIn("SECRET123", err.getvalue())
+            self.assertEqual(len(err.getvalue().splitlines()), 1)
+            self.assertTrue(err.getvalue().startswith("error: "))
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
 
     def test_reject_huge_file(self):
         self.assert_rejected("x" * (w._VV_MAX_BYTES + 1), "implausibly large")
@@ -281,13 +312,71 @@ class ParseVvTests(unittest.TestCase):
         with self.assertRaises(w.VvError):
             w.parse_vv("/nonexistent/path.vv")
 
+    def test_reject_bad_title(self):
+        # Value: protects=title= outside printable ASCII or over 200 chars is rejected before anything launches; fails_when=the title guard is dropped or _TITLE_RE is widened; why_new=title= was the only validated key with no rejecting test, every template used a clean title; seam=none; no_claim=none beyond protects
+        # protects: title= outside printable ASCII (or over 200 chars) is
+        #   rejected before anything is launched.
+        # fails_when: the title guard is dropped or _TITLE_RE is widened.
+        # why_new: title= was the only validated key with no rejecting test;
+        #   every template in the suite used a clean title.
+        # seam: assert_rejected through the real parser on real temp files.
+        for bad in ("", "tab\ttitle", "x" * 201, "del\x7fchar"):
+            with self.subTest(bad=repr(bad)):
+                self.assert_rejected(
+                    VV_TEMPLATE.format(port=PORT, password=TICKET, title=bad),
+                    "title",
+                )
+
+    def test_reject_delete_this_file_not_one(self):
+        # Value: protects=delete-this-file is accepted only with the exact value cv4pve-vdi writes; fails_when=the "!= 1" value check is dropped or loosened; why_new=only the =1 and absent variants were exercised, =0 passed untested; seam=none; no_claim=none beyond protects
+        # protects: delete-this-file is accepted only with the exact value
+        #   cv4pve-vdi writes; any other value means the file shape changed.
+        # fails_when: the "!= 1" value check is dropped or loosened.
+        # why_new: only the =1 and absent variants were exercised; =0 passed
+        #   through the suite untested although the guard exists.
+        # seam: assert_rejected through the real parser.
+        self.assert_rejected(
+            VV_TEMPLATE.format(port=PORT, password=TICKET, title="t").replace(
+                "delete-this-file=1", "delete-this-file=0"
+            ),
+            "delete-this-file",
+        )
+
+    def test_reject_unreadable_file(self):
+        # Value: protects=an unreadable .vv becomes one VvError (cannot read connection file), not a traceback or a silent pass; fails_when=the except OSError around open() is removed or narrowed; why_new=the not-found path had a test, open()-failing had none; seam=none; no_claim=real filesystem denial shapes, one mocked errno only
+        # protects: an unreadable .vv becomes one VvError ("cannot read
+        #   connection file"), not a traceback or a silent pass.
+        # fails_when: the except OSError around open() is removed or narrowed.
+        # why_new: the not-found path had a test, open()-failing had none.
+        # seam: builtins.open mocked to raise OSError; isfile/unlink stay real.
+        # parse_vv deletes the .vv only after a successful read, so for an
+        # unreadable file the no-file-left-behind promise is kept by main()'s
+        # reject path — both levels are asserted here.
+        path = valid_vv()
+        try:
+            with mock.patch("builtins.open", side_effect=OSError(13, "Permission denied")), \
+                    self.assertRaises(w.VvError) as ctx:
+                w.parse_vv(path)
+            self.assertIn("cannot read connection file", str(ctx.exception))
+            err = io.StringIO()
+            with mock.patch("builtins.open", side_effect=OSError(13, "Permission denied")), \
+                    contextlib.redirect_stderr(err):
+                rc = w.main([path])
+            self.assertEqual(rc, 2)
+            self.assertTrue(err.getvalue().startswith("error: "))
+            self.assertFalse(os.path.exists(path))
+        finally:
+            if os.path.exists(path):
+                os.unlink(path)
+
     def test_reject_invalid_utf8(self):
         fd, path = tempfile.mkstemp(suffix=".vv")
         with os.fdopen(fd, "wb") as fh:
             fh.write(b"[virt-viewer]\npassword=\xff\xfe\n")
         try:
-            with self.assertRaises(w.VvError):
+            with self.assertRaises(w.VvError) as ctx:
                 w.parse_vv(path)
+            self.assertIn("not valid UTF-8", str(ctx.exception))
         finally:
             if os.path.exists(path):
                 os.unlink(path)
@@ -297,8 +386,9 @@ class LaunchTests(unittest.TestCase):
     def test_viewer_missing_fails_closed(self):
         with mock.patch.dict(os.environ, {w.VIEWER_ENV_OVERRIDE: "/nonexistent/vncviewer"}), \
                 mock.patch.object(w, "find_viewer", wraps=w.find_viewer), \
-                self.assertRaises(w.VvError):
+                self.assertRaises(w.VvError) as ctx:
             w.find_viewer()
+        self.assertIn("not found or not executable", str(ctx.exception))
 
     def test_build_viewer_argv(self):
         argv = w.build_viewer_argv("/vncviewer", "/tmp/pw.bin", 5900)
@@ -328,15 +418,103 @@ class LaunchTests(unittest.TestCase):
     def test_main_rejects_wrong_argc(self):
         self.assertEqual(w.main([]), 2)
         self.assertEqual(w.main(["a.vv", "b.vv"]), 2)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(w.main(["-h"]), 2)
+            self.assertEqual(w.main(["--help"]), 2)
+        self.assertIn("usage:", err.getvalue())
 
     def test_main_reports_bad_vv(self):
         path = write_vv("type=spice\n")
+        err = io.StringIO()
         try:
-            rc = w.main([path])
+            with contextlib.redirect_stderr(err):
+                rc = w.main([path])
             self.assertEqual(rc, 2)
+            # cv4pve-vdi shows the user whatever lands on stderr: one line,
+            # prefixed error:, no traceback.
+            self.assertTrue(err.getvalue().startswith("error: "))
         finally:
             if os.path.exists(path):
                 os.unlink(path)
+
+    def test_launch_failure_after_passwd_file_cleans_up(self):
+        # Value: protects=a launch failure after the password file exists returns 2 with one error line and no residue, and the file is 0600 when the viewer sees it; fails_when=the except OSError around the launch or the finally cleanup is lost, or the file stops being created 0600; why_new=the existing failure test dies at find_viewer before mkstemp, the post-creation OSError branch had no test; seam=none; no_claim=real viewer behavior, Popen is mocked
+        # protects: when Popen itself fails after the password file exists
+        #   (viewer vanished since the isfile check, exec format error, ...),
+        #   main returns 2 with one error line and the file is unlinked.
+        #   Also protects the 0600 mode the module docstring promises for the
+        #   ticket file: mkstemp gives it today, a refactor to open() would
+        #   not, and nothing else would catch the widening.
+        # fails_when: the except OSError around the launch is removed, the
+        #   finally cleanup no longer covers the launch-failure path, or the
+        #   password file stops being created 0600.
+        # why_new: the existing failure test dies at find_viewer(), before
+        #   mkstemp; the post-creation OSError branch had no test at all.
+        # seam: real find_viewer on an executable stub; Popen mocked to stat
+        #   its argv then raise, so the temp file is observed before cleanup.
+        stub = os.path.join(tempfile.mkdtemp(), "stub_viewer")
+        with open(stub, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(stub, stat.S_IRWXU)
+        vv_path = valid_vv()
+        err = io.StringIO()
+        seen = {}
+
+        def popen_fails(argv, **_kwargs):
+            seen["mode"] = stat.S_IMODE(os.stat(argv[2]).st_mode)  # argv[2] = -passwd value
+            raise OSError(8, "Exec format error")
+
+        with mock.patch.dict(os.environ, {w.VIEWER_ENV_OVERRIDE: stub}), \
+                mock.patch.object(w.subprocess, "Popen", side_effect=popen_fails), \
+                contextlib.redirect_stderr(err):
+            rc = w.main([vv_path])
+        self.assertEqual(rc, 2)
+        self.assertTrue(err.getvalue().startswith("error: "))
+        self.assertIn("failed to launch viewer", err.getvalue())
+        self.assertEqual(seen.get("mode"), 0o600)
+        residue = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(".pve-vnc-passwd-")]
+        self.assertEqual(residue, [])
+
+    def test_passwd_file_holds_only_obfuscated_bytes(self):
+        # Regression: every other test checks the password file's absence,
+        # never its content — a plaintext-ticket regression (writing the
+        # ticket itself, or dropping env=child_env()) passed the whole suite.
+        # Value: protects=only the 8 DES-obfuscated bytes reach disk and the child env carries no VNC_* override; fails_when=the write uses the raw password instead of vncpasswd_obfuscate, or Popen drops env=child_env(); why_new=no test read the file's bytes or the child's environment; seam=none; no_claim=real viewer behavior, a /bin/sh stub stands in
+        evidence = os.path.join(tempfile.mkdtemp(), "evidence")
+        stub = os.path.join(tempfile.mkdtemp(), "stub_viewer")
+        with open(stub, "w") as fh:
+            fh.write(
+                "#!/bin/sh\n"
+                'pf=$(printf "%s\\n" "$@" | awk \'/^-passwd$/{getline; print}\')\n'
+                f'printf "MODE:%s\\n" "$(stat -f %Lp "$pf")" > "{evidence}"\n'
+                f'xxd -p "$pf" | tr -d \'\\n\' >> "{evidence}"; printf "\\n" >> "{evidence}"\n'
+                '[ -n "${VNC_PASSWORD:-}${VNC_USERNAME:-}" ] && echo ENVLEAK >> "' + evidence + '"\n'
+                "exit 0\n"
+            )
+        os.chmod(stub, stat.S_IRWXU)
+        vv_path = valid_vv()
+        with mock.patch.dict(os.environ, {w.VIEWER_ENV_OVERRIDE: stub,
+                                          "VNC_PASSWORD": "stale",
+                                          "VNC_USERNAME": "bob"}):
+            rc = w.main([vv_path])
+        self.assertEqual(rc, 0)
+        with open(evidence) as fh:
+            got = fh.read()
+        self.assertEqual(got, f"MODE:600\n{w.vncpasswd_obfuscate(TICKET).hex()}\n")
+        self.assertFalse(os.path.exists(vv_path))
+
+    def test_signaled_viewer_exits_128_plus_n(self):
+        # wait() returns -9 for a SIGKILLed viewer; the wrapper must report
+        # the conventional 128+9 instead of sys.exit(-9)'s ambiguous 247.
+        # Value: protects=a viewer killed by signal N exits 128+N, not the mangled negative; fails_when=the negative return code is passed through; why_new=no test covered a signaled viewer; seam=none; no_claim=none beyond protects
+        stub = os.path.join(tempfile.mkdtemp(), "stub_viewer")
+        with open(stub, "w") as fh:
+            fh.write("#!/bin/sh\nkill -9 $$\n")
+        os.chmod(stub, stat.S_IRWXU)
+        vv_path = valid_vv()
+        with mock.patch.dict(os.environ, {w.VIEWER_ENV_OVERRIDE: stub}):
+            self.assertEqual(w.main([vv_path]), 137)
 
     def test_real_launch_with_stub_viewer(self):
         """End-to-end through main() with a stub viewer that prints its argv
@@ -359,6 +537,90 @@ class LaunchTests(unittest.TestCase):
         with open(argv_log) as fh:
             self.assertEqual(fh.read().split(), ["-SecurityTypes", "VncAuth", f"127.0.0.1::{PORT}"])
         self.assertFalse(os.path.exists(vv_path))
+        residue = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(".pve-vnc-passwd-")]
+        self.assertEqual(residue, [])
+
+    def test_sigterm_exits_143_and_cleans_passwd_file(self):
+        # Value: protects=SIGTERM routes through the finally block, deleting the password file, and exits 143; fails_when=_install_sigterm_handler is not installed or the finally cleanup is lost; why_new=the handler was the only product path with zero tests and carries the no-ticket-file-left promise; seam=none; no_claim=none beyond protects, real subprocess
+        # protects: the SIGTERM->SystemExit(128+15) handler. When cv4pve-vdi
+        #   tears the bridge down and signals the wrapper, the password file
+        #   is still deleted (the handler routes SIGTERM through the finally
+        #   block) and the process exits with the conventional code 143.
+        # fails_when: _install_sigterm_handler is not installed (the default
+        #   SIGTERM kill skips finally blocks and leaks the ticket file), or
+        #   the finally cleanup is lost.
+        # why_new: the handler was the only product code path with zero tests,
+        #   and it carries the "no ticket file left behind" promise.
+        # seam: the real script as a subprocess with a stub viewer that marks
+        #   readiness then sleeps; SIGTERM via proc.send_signal.
+        work = tempfile.mkdtemp()
+        marker = os.path.join(work, "started")
+        stub = os.path.join(work, "stub_viewer")
+        with open(stub, "w") as fh:
+            fh.write(f'#!/bin/sh\nprintf x > "{marker}"\nsleep 10\n')
+        os.chmod(stub, stat.S_IRWXU)
+        vv_path = valid_vv()
+        env = dict(os.environ, **{w.VIEWER_ENV_OVERRIDE: stub})
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(w.__file__), vv_path],
+            env=dict(env, TMPDIR=tempfile.gettempdir()),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while not os.path.exists(marker) and time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    self.fail(f"wrapper exited early with {proc.returncode}")
+                time.sleep(0.05)
+            self.assertTrue(os.path.exists(marker), "stub viewer never started")
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            if os.path.exists(vv_path):
+                os.unlink(vv_path)
+        self.assertEqual(proc.returncode, 143)
+        residue = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(".pve-vnc-passwd-")]
+        self.assertEqual(residue, [])
+
+    def test_sigint_exits_130_and_cleans_passwd_file(self):
+        # SIGINT arrives as KeyboardInterrupt by default: cleanup runs, but the
+        # process dies on a raw traceback with an interpreter-chosen status.
+        # The handler routes it the same way as SIGTERM: clean 130, no residue.
+        # Value: protects=SIGINT exits 130 with the password file deleted, no traceback; fails_when=the handler is installed for SIGTERM only; why_new=only SIGTERM had a test; seam=none; no_claim=none beyond protects, real subprocess
+        work = tempfile.mkdtemp()
+        marker = os.path.join(work, "started")
+        stub = os.path.join(work, "stub_viewer")
+        with open(stub, "w") as fh:
+            fh.write(f'#!/bin/sh\nprintf x > "{marker}"\nsleep 10\n')
+        os.chmod(stub, stat.S_IRWXU)
+        vv_path = valid_vv()
+        env = dict(os.environ, **{w.VIEWER_ENV_OVERRIDE: stub})
+        proc = subprocess.Popen(
+            [sys.executable, os.path.abspath(w.__file__), vv_path],
+            env=dict(env, TMPDIR=tempfile.gettempdir()),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            deadline = time.monotonic() + 10
+            while not os.path.exists(marker) and time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    self.fail(f"wrapper exited early with {proc.returncode}")
+                time.sleep(0.05)
+            self.assertTrue(os.path.exists(marker), "stub viewer never started")
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+            if os.path.exists(vv_path):
+                os.unlink(vv_path)
+        self.assertEqual(proc.returncode, 130)
         residue = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(".pve-vnc-passwd-")]
         self.assertEqual(residue, [])
 

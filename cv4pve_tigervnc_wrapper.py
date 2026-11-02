@@ -14,7 +14,8 @@ macOS build, so this wrapper stands in as the viewer:
      stay alive until the viewer exits — cv4pve-vdi tears down its websocket
      bridge when the process it launched exits, so the wrapper must outlive
      the viewer,
-  5. delete the password file when the viewer exits (also on SIGTERM/SIGINT).
+  5. delete the password file when the viewer exits (also on SIGTERM/SIGINT,
+     both of which exit 128+N with no traceback).
 
 Security properties:
   - Python stdlib only; the viewer is launched with a list argv, no shell
@@ -425,19 +426,25 @@ def parse_vv(path):
     try:
         cp.read_string(text)
     except configparser.Error as exc:
-        raise VvError(f"connection file is not valid INI: {exc}") from None
+        # configparser's message quotes the offending raw line from the file,
+        # which can carry the ticket; only the exception class is safe to echo.
+        raise VvError(f"connection file is not valid INI ({type(exc).__name__})") from None
 
     if cp.defaults():
         raise VvError("unexpected [DEFAULT] section in connection file")
 
     sections = cp.sections()
     if sections != ["virt-viewer"]:
-        raise VvError(f"expected exactly one [virt-viewer] section, got {sections!r}")
+        raise VvError(f"expected exactly one [virt-viewer] section, got {len(sections)}")
 
     keys = cp.options("virt-viewer")
     unknown = [k for k in keys if k not in _KNOWN_KEYS]
     if unknown:
-        raise VvError(f"unknown key(s) in connection file: {', '.join(sorted(unknown))}")
+        # Key names come from the file, so echo them only when they look like
+        # something cv4pve-vdi would write; anything else may be hostile bytes.
+        plain = [k for k in sorted(unknown) if re.fullmatch(r"[A-Za-z0-9-]{1,32}", k)]
+        detail = f": {', '.join(plain)}" if len(plain) == len(unknown) else ""
+        raise VvError(f"unknown key(s) in connection file{detail}")
     missing = [k for k in _REQUIRED_KEYS if k not in keys]
     if missing:
         raise VvError(f"missing key(s) in connection file: {', '.join(missing)}")
@@ -446,13 +453,13 @@ def parse_vv(path):
         return cp.get("virt-viewer", k)
 
     if get("type") != "vnc":
-        raise VvError(f"only VNC connection files are supported (type={get('type')!r})")
+        raise VvError("only VNC connection files are supported (type is not vnc)")
     if get("host") != "127.0.0.1":
-        raise VvError(f"refusing non-localhost VNC target (host={get('host')!r})")
+        raise VvError("refusing non-localhost VNC target")
 
     port = get("port")
     if not _PORT_RE.match(port) or not 1 <= int(port) <= 65535:
-        raise VvError(f"invalid port {port!r}")
+        raise VvError("invalid port")
 
     password = get("password")
     if not password:
@@ -472,7 +479,7 @@ def parse_vv(path):
         raise VvError("title failed charset validation")
 
     if "delete-this-file" in keys and get("delete-this-file") != "1":
-        raise VvError(f"unexpected delete-this-file={get('delete-this-file')!r}")
+        raise VvError("unexpected delete-this-file value")
 
     return int(port), password
 
@@ -524,8 +531,9 @@ def main(argv):
         sys.stderr.write(f"error: {exc}\n")
         return 2
 
-    # Replicate delete-this-file=1: the .vv holds the ticket in plain text and
-    # is of no further use once parsed. Nothing launched later can read it.
+    # Belt-and-braces: parse_vv already unlinked the .vv after reading it, so
+    # this covers only the window where parse_vv failed before its own read.
+    # The .vv holds the ticket in plain text; nothing launched later may read it.
     with contextlib.suppress(OSError):
         os.unlink(vv_path)
 
@@ -546,8 +554,11 @@ def main(argv):
             env=child_env(),
         )
         # Outlive the viewer: cv4pve-vdi disposes its websocket bridge when
-        # this process exits.
-        return proc.wait()
+        # this process exits. wait() returns -N when the viewer died of
+        # signal N; report the conventional 128+N instead of the negative
+        # value, which sys.exit would mangle into an ambiguous byte.
+        rc = proc.wait()
+        return rc if rc >= 0 else 128 - rc
     except OSError as exc:
         sys.stderr.write(f"error: failed to launch viewer: {exc}\n")
         return 2
@@ -557,12 +568,15 @@ def main(argv):
 
 
 def _install_sigterm_handler():
-    # Default SIGTERM kills without running finally blocks; turn it into an
-    # exception so the password file cleanup still runs.
+    # Default SIGTERM/SIGINT kill without running finally blocks (SIGINT's
+    # KeyboardInterrupt does run them, but dies on a raw traceback); turn both
+    # into an exception so the password file cleanup runs and the exit code is
+    # the conventional 128+N.
     def handler(signum, _frame):
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, handler)
+    signal.signal(signal.SIGINT, handler)
 
 
 if __name__ == "__main__":

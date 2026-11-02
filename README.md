@@ -82,17 +82,29 @@ once the session is over. `kill -TERM` and normal exit are both covered.
 The wrapper has to stay alive for the whole session. cv4pve-vdi's
 `RemoteViewerService` disposes the bridge when the process it launched exits,
 so a wrapper that exits after spawning the viewer would take the console down
-with it. `SIGTERM` is turned into a `SystemExit` so the password file gets
-removed on that path too.
+with it. `SIGTERM` and `SIGINT` are turned into a `SystemExit` of 128+N so the
+password file gets removed on that path too. The wrapper does not kill the
+viewer on those signals: the viewer dies on its own a moment later when
+cv4pve-vdi disposes the bridge, which is the designed teardown.
+
+Two more behaviors worth knowing: the wrapper deletes whatever file path it is
+given before validating it (cv4pve-vdi hands it a temp file it just wrote; do
+not point the script at a file you want to keep), and a viewer that dies of a
+signal exits the wrapper with 128+N rather than the viewer's raw negative
+status.
 
 ## Errors
 
-Every failure prints one line starting with `error:` and exits 2, before
-anything is launched. The three ticket messages tell you which stage broke:
+Every rejection prints one line starting with `error:` and exits 2, before
+anything is launched; a bad invocation (no argument, or `-h`) prints a `usage:`
+line instead. No message ever quotes the file's contents back at you: a
+rejected connection file may be hostile, so diagnostics name the failed check,
+not the bytes that failed it. The three ticket messages tell you which stage
+broke:
 
 | Message | Meaning |
 | --- | --- |
-| `missing key(s) in connection file: ...` | cv4pve-vdi wrote a file it shouldn't have. It names the keys it did find. |
+| `missing key(s) in connection file: ...` | cv4pve-vdi wrote a file without one of the required keys. It names the keys that are **absent**. |
 | `password= is empty: cv4pve-vdi got no VNC ticket from PVE` | PVE refused the ticket. Check that the user holds VM.Console and VM.Audit on the guest, and that the guest is running. |
 | `password (VNC ticket) has N unexpected character(s): U+XXXX` | Something other than PVE wrote this file, or the ticket was mangled. Reports the offending code points. |
 
@@ -111,7 +123,9 @@ viewer. So:
   read. The ticket reaches one place, the 0600 password file, and `configparser`
   with `interpolation=None` round-trips every one of them unchanged.
 - The ticket never enters argv, the environment, or any log. The password file
-  holds the 8 obfuscated bytes and nothing else.
+  holds the 8 obfuscated bytes and nothing else. Rejection messages never quote
+  the file's contents either: diagnostics name the failed check, not the bytes
+  that failed it.
 - `VNC_PASSWORD` and `VNC_USERNAME` are stripped from the child environment.
   TigerVNC prefers those over `-passwd`, so a stale value would silently beat
   the ticket.
@@ -124,10 +138,14 @@ viewer. So:
 python3 -m unittest test_cv4pve_tigervnc_wrapper
 ```
 
-35 tests, no network, and TigerVNC is never started. `find_viewer` is patched
-out except in one test that runs `main()` against a `/bin/sh` stub which records
-its argv and exits 7, checking that the wrapper waits for the child, passes the
-exit code up, and leaves no password file behind.
+44 tests, no network, and TigerVNC is never started: `main()` is driven
+end to end against `/bin/sh` stubs. One stub records the password file's bytes
+and mode, proving the file holds exactly `vncpasswd_obfuscate(ticket)` and
+nothing else; another exits 7 to prove the child's exit code passes through;
+another kills itself to prove a signaled viewer exits 128+N; and two run the
+real script as a subprocess to prove SIGTERM and SIGINT each clean up the
+password file on their way out. `find_viewer` always runs for real, pointed at
+a stub through `$CV4PVE_TIGERVNC_VIEWER`.
 
 The DES port is checked against the vector documented in TigerVNC's `d3des.c`
 (`c95744256a5ed31d`) and cross-checked against `openssl enc -des-ecb`, which the
@@ -140,13 +158,24 @@ ways.
 ## Provenance
 
 The DES tables and round function are transcribed from TigerVNC's
-`common/rfb/d3des.c`. That file is Richard Outerbridge's D3DES V5.09, marked
-public domain in its own header, reduced to single-length DES by AT&T
-Laboratories Cambridge with the `bytebit[]` table reversed. The AT&T changes
-carry a copyright line and a warranty disclaimer, not a copyleft grant, so the
-port sits here under this repo's MIT license. TigerVNC itself is GPLv2; nothing
-from outside `d3des.c` was taken, and the viewer is a separate process this
-script only execs.
+`common/rfb/d3des.c`. That file's own header reads, in part:
+
+> This is D3DES (V5.09) by Richard Outerbridge with the double and
+> triple-length support removed for use in VNC. Also the bytebit[] array
+> has been reversed so that the most significant bit in each byte of the
+> key is ignored, not the least.
+>
+> These changes are: Copyright (C) 1999 AT&T Laboratories Cambridge.
+> All Rights Reserved.
+>
+> A portable, public domain, version of the Data Encryption Standard.
+> Copyright (c) 1988,1989,1990,1991,1992 by Richard Outerbridge.
+
+Outerbridge's implementation is public domain by its own statement, and the
+AT&T Cambridge reduction carries a copyright line and a warranty disclaimer,
+not a copyleft grant, so the port sits here under this repo's MIT license.
+TigerVNC itself is GPLv2; nothing from outside `d3des.c` was taken, and the
+viewer is a separate process this script only execs.
 
 Everything else was written for this repo. `.vv` field names and the ticket
 format come from reading `Corsinvest/cv4pve-api-dotnet`
