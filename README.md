@@ -139,9 +139,9 @@ The DES tables and round function are transcribed from TigerVNC's
 public domain in its own header, reduced to single-length DES by AT&T
 Laboratories Cambridge with the `bytebit[]` table reversed. The AT&T changes
 carry a copyright line and a warranty disclaimer, not a copyleft grant, so the
-port can sit here under whatever license this repo picks. TigerVNC itself is
-GPLv2; nothing from outside `d3des.c` was taken, and the viewer is a separate
-process this script only execs.
+port sits here under this repo's MIT license. TigerVNC itself is GPLv2; nothing
+from outside `d3des.c` was taken, and the viewer is a separate process this
+script only execs.
 
 Everything else was written for this repo. `.vv` field names and the ticket
 format come from reading `Corsinvest/cv4pve-api-dotnet`
