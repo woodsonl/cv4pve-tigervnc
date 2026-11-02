@@ -1,0 +1,20 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    # macOS is the platform this wrapper targets; /usr/bin/python3 there is
+    # 3.9, which is the interpreter floor the code claims to support.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - run: pip install ruff
+      - run: ruff check .
+      - run: python3 -m unittest test_cv4pve_tigervnc_wrapper
