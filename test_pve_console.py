@@ -84,6 +84,13 @@ class FrameCodecTests(unittest.TestCase):
             rd.frame()
 
 
+    def test_expected_ws_accept_matches_rfc_example(self):
+        # Value: protects=the upgrade response is verified against the RFC 6455 derivation, so a non-websocket endpoint cannot be mistaken for the session; fails_when=the accept computation drifts from the spec; why_new=no test covered the handshake verification; seam=none; no_claim=none beyond protects
+        self.assertEqual(
+            pc.expected_ws_accept("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+
+
 class VvEmissionTests(unittest.TestCase):
     # Value: protects=the .vv handed to the wrapper carries the bridge's local port and the full prefixed ticket; fails_when=the vv loses the ticket or points at the wrong port; why_new=the wrapper's own tests only cover .vvs built by cv4pve-vdi; seam=none (ws_connect mocked); no_claim=network behavior, websocket is mocked
     def test_vv_carries_ticket_and_local_port(self):

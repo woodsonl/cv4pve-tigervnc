@@ -24,7 +24,9 @@ the local listener binds loopback only and accepts a single connection.
 
 import argparse
 import base64
+import hashlib
 import json
+import shlex
 import os
 import signal
 import socket
@@ -99,12 +101,20 @@ class WsReader:
 # PVE side: ticket mint over SSH, then the websocket upgrade
 # --------------------------------------------------------------------------
 
+_WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def expected_ws_accept(key):
+    """The Sec-WebSocket-Accept value a server must return for our key."""
+    return base64.b64encode(hashlib.sha1((key + _WS_GUID).encode()).digest()).decode()
+
 
 def mint(host, node, vmid):
     """Mint a websocket VNC ticket plus an API session cookie over SSH."""
     out = subprocess.check_output(
         ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "root@" + host,
-         f"pvesh create /nodes/{node}/qemu/{vmid}/vncproxy --websocket 1 --output-format json; "
+         f"pvesh create /nodes/{shlex.quote(node)}/qemu/{vmid}/vncproxy"
+         " --websocket 1 --output-format json; "
          "perl -MPVE::AccessControl -e 'print PVE::AccessControl::assemble_ticket(q(root@pam))'"],
         timeout=30,
     ).decode()
@@ -121,8 +131,13 @@ def ws_connect(host, port, node, vmid, vnc, api_ticket, validate_cert):
         ctx.verify_mode = ssl.CERT_REQUIRED
         ctx.check_hostname = True
     else:
+        # The session cookie rides this connection; an unvalidated certificate
+        # means a man in the middle could read it. Kept off by default because
+        # self-signed hosts are the norm for PVE, same default as cv4pve-vdi.
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
+        print("warning: certificate validation off; the session cookie is "
+              "sent unvalidated", file=sys.stderr)
     sock = ctx.wrap_socket(raw, server_hostname=host)
     key = base64.b64encode(os.urandom(16)).decode()
     q = urllib.parse.urlencode({"port": vnc["port"], "vncticket": vnc["ticket"]})
@@ -138,17 +153,27 @@ def ws_connect(host, port, node, vmid, vnc, api_ticket, validate_cert):
         "\r\n"
     )
     sock.sendall(request.encode())
-    sock.settimeout(None)
+    sock.settimeout(10)  # a stalled upgrade must not hang the launcher
     buf = b""
     while b"\r\n\r\n" not in buf:
+        if len(buf) > 65536:
+            raise RuntimeError("websocket upgrade response too large")
         chunk = sock.recv(4096)
         if not chunk:
             raise RuntimeError("EOF during websocket upgrade")
         buf += chunk
+    sock.settimeout(None)  # only a confirmed session may block indefinitely
     head, _, rest = buf.partition(b"\r\n\r\n")
     status = head.split(b"\r\n")[0].decode("latin-1")
     if " 101 " not in status:
         raise RuntimeError(f"websocket upgrade refused: {status}")
+    accept = None
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"sec-websocket-accept":
+            accept = value.strip().decode("latin-1")
+    if accept != expected_ws_accept(key):
+        raise RuntimeError("websocket accept key mismatch")
     return sock, rest
 
 
@@ -167,7 +192,8 @@ def bridge_and_launch(vnc, api_ticket, args):
     listener.listen(1)
     local_port = listener.getsockname()[1]
 
-    vv_path = os.path.join(tempfile.mkdtemp(prefix="pve-console-"), "console.vv")
+    vv_dir = tempfile.mkdtemp(prefix="pve-console-")
+    vv_path = os.path.join(vv_dir, "console.vv")
     with open(vv_path, "w") as fh:
         fh.write("[virt-viewer]\ntype=vnc\nhost=127.0.0.1\n"
                  f"port={local_port}\npassword={vnc['ticket']}\n"
@@ -178,9 +204,32 @@ def bridge_and_launch(vnc, api_ticket, args):
     env = dict(os.environ)
     if args.viewer:
         env["CV4PVE_TIGERVNC_VIEWER"] = args.viewer
-    viewer = subprocess.Popen([sys.executable, wrapper, vv_path], env=env)
-
-    tcp, _ = listener.accept()
+    try:
+        viewer = subprocess.Popen([sys.executable, wrapper, vv_path], env=env)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(vv_path)
+        with contextlib.suppress(OSError):
+            os.rmdir(vv_dir)
+        with contextlib.suppress(OSError):
+            os.rmdir(vv_dir)
+        listener.close()
+        sock.close()
+        raise
+    tcp = None
+    try:
+        tcp, _ = listener.accept()
+    except OSError:
+        viewer.terminate()
+        with contextlib.suppress(OSError):
+            os.unlink(vv_path)
+        with contextlib.suppress(OSError):
+            os.rmdir(vv_dir)
+        with contextlib.suppress(OSError):
+            os.rmdir(vv_dir)
+        listener.close()
+        sock.close()
+        raise
     tcp.settimeout(None)
     print(f"console: VM {args.vmid} on 127.0.0.1:{local_port}", file=sys.stderr)
 
@@ -191,7 +240,7 @@ def bridge_and_launch(vnc, api_ticket, args):
                 if opcode == 8:
                     break
                 if opcode == 9:
-                    ws_send_frame(sock, payload, 0xA)
+                    ws_send(payload, 0xA)
                     continue
                 if opcode in (1, 2) and payload:
                     tcp.sendall(payload)
@@ -210,12 +259,18 @@ def bridge_and_launch(vnc, api_ticket, args):
                 data = tcp.recv(65536)
                 if not data:
                     break
-                ws_send_frame(sock, data)
+                ws_send(data)
         except OSError:
             pass
         finally:
             with contextlib.suppress(OSError):
-                ws_send_frame(sock, b"", 8)
+                ws_send(b"", 8)
+
+    ws_lock = threading.Lock()
+
+    def ws_send(data, opcode=2):
+        with ws_lock:
+            ws_send_frame(sock, data, opcode)
 
     pumps = [threading.Thread(target=ws_to_tcp, daemon=True),
              threading.Thread(target=tcp_to_ws, daemon=True)]
@@ -232,6 +287,8 @@ def bridge_and_launch(vnc, api_ticket, args):
         sock.close()
         with contextlib.suppress(OSError):
             os.unlink(vv_path)
+        with contextlib.suppress(OSError):
+            os.rmdir(vv_dir)
 
 
 def main(argv=None):
