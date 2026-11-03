@@ -528,7 +528,11 @@ class LaunchTests(unittest.TestCase):
             fh.write(
                 "#!/bin/sh\n"
                 'pf=$(printf "%s\\n" "$@" | awk \'/^-passwd$/{getline; print}\')\n'
-                f'printf "MODE:%s\\n" "$(stat -f %Lp "$pf")" > "{evidence}"\n'
+                # GNU stat and BSD stat disagree on flags. GNU-first: BSD stat
+                # has no -c and exits non-zero, so its branch only fires there;
+                # GNU stat -f would otherwise "succeed" with a filesystem dump.
+                'mode=$(stat -c %a "$pf" 2>/dev/null || stat -f %Lp "$pf")\n'
+                f'printf "MODE:%s\\n" "$mode" > "{evidence}"\n'
                 f'xxd -p "$pf" | tr -d \'\\n\' >> "{evidence}"; printf "\\n" >> "{evidence}"\n'
                 '[ -n "${VNC_PASSWORD:-}${VNC_USERNAME:-}" ] && echo ENVLEAK >> "' + evidence + '"\n'
                 "exit 0\n"
