@@ -10,7 +10,9 @@ macOS build, so this wrapper stands in as the viewer:
   2. delete the .vv file immediately after parsing,
   3. write the one-time VNC ticket as a vncpasswd-format password file
      (0600, DES-obfuscated exactly like `vncpasswd`),
-  4. launch TigerVNC against the localhost bridge on 127.0.0.1::<port> and
+  4. launch TigerVNC against the localhost bridge on 127.0.0.1::<port>,
+     requesting a shared session (-Shared: TigerVNC's default is exclusive
+     access, which disconnects every other viewer of the same VM), and
      stay alive until the viewer exits — cv4pve-vdi tears down its websocket
      bridge when the process it launched exits, so the wrapper must outlive
      the viewer,
@@ -506,7 +508,19 @@ def find_viewer():
 def build_viewer_argv(viewer, passwd_file, port):
     # -SecurityTypes VncAuth matches what the PVE bridge offers; the host is
     # the constant localhost shape (host=127.0.0.1 is enforced at parse time).
-    return [viewer, "-passwd", passwd_file, "-SecurityTypes", "VncAuth", f"127.0.0.1::{port}"]
+    # -Shared: TigerVNC defaults to exclusive access, and QEMU (PVE's default
+    # share=allow-exclusive) honors that by disconnecting every other viewer.
+    # Without this flag, each new console window kills every existing session
+    # for the same VM.
+    return [
+        viewer,
+        "-passwd",
+        passwd_file,
+        "-SecurityTypes",
+        "VncAuth",
+        "-Shared",
+        f"127.0.0.1::{port}",
+    ]
 
 
 def child_env():

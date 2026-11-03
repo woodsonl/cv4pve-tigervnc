@@ -93,6 +93,26 @@ not point the script at a file you want to keep), and a viewer that dies of a
 signal exits the wrapper with 128+N rather than the viewer's raw negative
 status.
 
+## If the picture freezes
+
+A frozen frame means the session is dead, not busy. TigerVNC connects with
+exclusive access unless told otherwise, and QEMU (PVE's default
+`share=allow-exclusive`) honors that by disconnecting every other viewer: a
+new console window ends any live session for the same VM, and the window left
+on screen is the dead one. The wrapper passes `-Shared` on every launch, so
+its connections disconnect nobody. A client that connects outside the wrapper
+and asks for exclusive access can still end a session; `qm monitor <vmid>` →
+`info vnc` on the host shows who is connected.
+
+Two host-side lifetimes are worth knowing. The console ticket's roughly
+40-second window constrains opening a connection, not a session already
+running. An open session ends when the proxy task hits its idle timeout,
+about 15 minutes with no traffic in either direction, or when an exclusive
+client connects. When that happens, cv4pve-vdi's bridge does not always tell
+the viewer — it can leave the local socket open, so TigerVNC keeps the last
+framebuffer and your input goes nowhere. Close the window and open the
+console again.
+
 ## Errors
 
 Every rejection prints one line starting with `error:` and exits 2, before
