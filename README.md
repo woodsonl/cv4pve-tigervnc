@@ -104,11 +104,14 @@ its connections disconnect nobody. A client that connects outside the wrapper
 and asks for exclusive access can still end a session; `qm monitor <vmid>` →
 `info vnc` on the host shows who is connected.
 
-Two further lifetimes to know: the console ticket lives about 40 seconds, and
-the proxy task about 15 idle minutes. When the session behind a window goes
-away for either reason, cv4pve-vdi's bridge does not always tell the viewer —
-it can leave the local socket open, so TigerVNC keeps the last framebuffer and
-your input goes nowhere. Close the window and open the console again.
+Two host-side lifetimes are worth knowing. The console ticket's roughly
+40-second window constrains opening a connection, not a session already
+running. An open session ends when the proxy task hits its idle timeout,
+about 15 minutes with no traffic in either direction, or when an exclusive
+client connects. When that happens, cv4pve-vdi's bridge does not always tell
+the viewer — it can leave the local socket open, so TigerVNC keeps the last
+framebuffer and your input goes nowhere. Close the window and open the
+console again.
 
 ## Errors
 
