@@ -23,6 +23,21 @@ not affiliated with Corsinvest or Proxmox.
 chmod +x cv4pve_tigervnc_wrapper.py
 ```
 
+There is also a standalone launcher, `pve_console.py`, that opens a console
+without cv4pve-vdi at all:
+
+```sh
+./pve_console.py --host pve.lan --node pve --vmid 101
+```
+
+It mints the one-time ticket over SSH (root key access to the host), bridges
+the websocket itself, and runs the wrapper. It exists because cv4pve-vdi's
+bridge stops relaying viewer input while the screen keeps updating, so its
+consoles can render but accept no input; the standalone launcher relays both
+directions until the viewer exits, and closes the viewer's socket the moment
+the session ends so no window is left painting a dead console.
+
+
 Then in cv4pve-vdi, under Settings → Launchers:
 
 1. Set Viewer path to the absolute path of `cv4pve_tigervnc_wrapper.py`.
