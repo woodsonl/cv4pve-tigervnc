@@ -430,12 +430,14 @@ class LaunchTests(unittest.TestCase):
         self.assertIn("not found or not executable", str(ctx.exception))
 
     def test_build_viewer_argv(self):
+        # Value: protects=the viewer is asked to share, never to disconnect other viewers; fails_when=-Shared is dropped from the argv; why_new=TigerVNC defaults to exclusive access and QEMU honors it, so without this flag every new console window disconnects every existing session for the same VM; seam=none; no_claim=none beyond protects
         argv = w.build_viewer_argv("/vncviewer", "/tmp/pw.bin", 5900)
         self.assertEqual(argv[0], "/vncviewer")
         self.assertEqual(argv[1], "-passwd")
         self.assertIn("/tmp/pw.bin", argv)
         self.assertEqual(argv[-1], "127.0.0.1::5900")
         self.assertIn("-SecurityTypes", argv)
+        self.assertIn("-Shared", argv)
 
     def test_env_stripped(self):
         with mock.patch.dict(os.environ, {"VNC_PASSWORD": "stale", "VNC_USERNAME": "bob"}):
@@ -592,7 +594,7 @@ class LaunchTests(unittest.TestCase):
             rc = w.main([vv_path])
         self.assertEqual(rc, 7)  # wrapper waited for the child and passed rc up
         with open(argv_log) as fh:
-            self.assertEqual(fh.read().split(), ["-SecurityTypes", "VncAuth", f"127.0.0.1::{PORT}"])
+            self.assertEqual(fh.read().split(), ["-SecurityTypes", "VncAuth", "-Shared", f"127.0.0.1::{PORT}"])
         self.assertFalse(os.path.exists(vv_path))
         residue = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(".pve-vnc-passwd-")]
         self.assertEqual(residue, [])
