@@ -528,7 +528,10 @@ class LaunchTests(unittest.TestCase):
             fh.write(
                 "#!/bin/sh\n"
                 'pf=$(printf "%s\\n" "$@" | awk \'/^-passwd$/{getline; print}\')\n'
-                f'printf "MODE:%s\\n" "$(stat -f %Lp "$pf")" > "{evidence}"\n'
+                # BSD stat and GNU stat disagree on flags; try both so the
+                # stub works on macOS and Linux runners alike.
+                'mode=$(stat -f %Lp "$pf" 2>/dev/null || stat -c %a "$pf")\n'
+                f'printf "MODE:%s\\n" "$mode" > "{evidence}"\n'
                 f'xxd -p "$pf" | tr -d \'\\n\' >> "{evidence}"; printf "\\n" >> "{evidence}"\n'
                 '[ -n "${VNC_PASSWORD:-}${VNC_USERNAME:-}" ] && echo ENVLEAK >> "' + evidence + '"\n'
                 "exit 0\n"
