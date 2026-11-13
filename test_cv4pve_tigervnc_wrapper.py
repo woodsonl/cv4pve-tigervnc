@@ -604,23 +604,29 @@ class LaunchTests(unittest.TestCase):
         self.assertEqual(residue, [])
 
     def test_sigterm_exits_143_and_cleans_passwd_file(self):
-        # Value: protects=SIGTERM routes through the finally block, deleting the password file, and exits 143; fails_when=_install_sigterm_handler is not installed or the finally cleanup is lost; why_new=the handler was the only product path with zero tests and carries the no-ticket-file-left promise; seam=none; no_claim=none beyond protects, real subprocess
+        # Value: protects=SIGTERM routes through the finally block, terminating the running viewer, deleting the password file, and exiting 143; fails_when=_install_sigterm_handler is not installed, the finally cleanup is lost, or the viewer child is orphaned with a dead bridge socket; why_new=the handler was the only product path with zero tests and carries the no-ticket-file-left promise; seam=none; no_claim=none beyond protects, real subprocess
         # protects: the SIGTERM->SystemExit(128+15) handler. When cv4pve-vdi
-        #   tears the bridge down and signals the wrapper, the password file
-        #   is still deleted (the handler routes SIGTERM through the finally
-        #   block) and the process exits with the conventional code 143.
+        #   tears the bridge down and signals the wrapper, the running viewer
+        #   is terminated (a dead bridge must not leave a live console), the
+        #   password file is still deleted (the handler routes SIGTERM
+        #   through the finally block), and the process exits with the
+        #   conventional code 143.
         # fails_when: _install_sigterm_handler is not installed (the default
         #   SIGTERM kill skips finally blocks and leaks the ticket file), or
-        #   the finally cleanup is lost.
+        #   the finally cleanup is lost, or the viewer is not terminated.
         # why_new: the handler was the only product code path with zero tests,
         #   and it carries the "no ticket file left behind" promise.
         # seam: the real script as a subprocess with a stub viewer that marks
         #   readiness then sleeps; SIGTERM via proc.send_signal.
         work = tempfile.mkdtemp()
         marker = os.path.join(work, "started")
+        term_marker = os.path.join(work, "terminated")
         stub = os.path.join(work, "stub_viewer")
+        # sleep is backgrounded so `wait` is interruptible and the trap fires
+        # on SIGTERM immediately instead of after the sleep finishes.
         with open(stub, "w") as fh:
-            fh.write(f'#!/bin/sh\nprintf x > "{marker}"\nsleep 10\n')
+            fh.write(f'#!/bin/sh\ntrap \'printf x > "{term_marker}"; exit 143\' TERM\n'
+                     f'printf x > "{marker}"\nsleep 10 &\nwait\n')
         os.chmod(stub, stat.S_IRWXU)
         vv_path = valid_vv()
         env = dict(os.environ, **{w.VIEWER_ENV_OVERRIDE: stub})
@@ -646,6 +652,11 @@ class LaunchTests(unittest.TestCase):
             if os.path.exists(vv_path):
                 os.unlink(vv_path)
         self.assertEqual(proc.returncode, 143)
+        deadline = time.monotonic() + 10
+        while not os.path.exists(term_marker) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(os.path.exists(term_marker),
+                        "wrapper did not terminate the running viewer")
         residue = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(".pve-vnc-passwd-")]
         self.assertEqual(residue, [])
 

@@ -569,6 +569,7 @@ def main(argv):
     except OSError as exc:
         sys.stderr.write(f"error: cannot create password file: {exc}\n")
         return 2
+    proc = None
     try:
         # fdopen closes the descriptor on every path out of this block; a raw
         # os.close would leak it if the launch below raised first.
@@ -588,6 +589,12 @@ def main(argv):
         sys.stderr.write(f"error: failed to launch viewer: {exc}\n")
         return 2
     finally:
+        # A signal (SystemExit from the handler) must not orphan the running
+        # viewer with a dead bridge socket: stop it before the password file
+        # goes away. On the normal path wait() already reaped it.
+        if proc is not None and proc.poll() is None:
+            with contextlib.suppress(OSError):
+                proc.terminate()
         # The password file is the one secret-bearing artifact; a failed
         # unlink here (not the .vv's best-effort delete) is worth saying.
         try:

@@ -35,7 +35,9 @@ the websocket itself, and runs the wrapper. It exists because cv4pve-vdi's
 bridge stops relaying viewer input while the screen keeps updating, so its
 consoles can render but accept no input; the standalone launcher relays both
 directions until the viewer exits, and closes the viewer's socket the moment
-the session ends so no window is left painting a dead console.
+the session ends so no window is left painting a dead console. TLS certificate
+validation is on by default; pass `--insecure` for a self-signed host (the
+root session cookie then rides an unvalidated connection).
 
 
 Then in cv4pve-vdi, under Settings → Launchers:

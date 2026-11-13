@@ -2,8 +2,13 @@
 """Tests for pve_console.py: frame codec round-trips, .vv emission,
 argument handling. No network, no viewer, no PVE."""
 
+import base64
+import errno
+import io
 import os
+import socket
 import struct
+import time
 import unittest
 from unittest import mock
 
@@ -55,15 +60,46 @@ class FrameCodecTests(unittest.TestCase):
         # Value: protects=the reader returns exactly the payload the server sent across every length form; fails_when=length parsing drifts from RFC 6455; why_new=no other test exercises the decoder; seam=none; no_claim=none beyond protects
         for size in (0, 1, 125, 126, 300):
             payload = os.urandom(size)
-            opcode, back = self._read_via(self._server_frame(payload)).frame()
+            fin, opcode, back = self._read_via(self._server_frame(payload)).frame()
+            self.assertTrue(fin)
             self.assertEqual(opcode, 2)
             self.assertEqual(back, payload)
 
     def test_two_frames_split_across_one_recv(self):
         a, b = b"first", b"second"
         rd = self._read_via(self._server_frame(a) + self._server_frame(b))
-        self.assertEqual(rd.frame()[1], a)
-        self.assertEqual(rd.frame()[1], b)
+        self.assertEqual(rd.frame()[1:], (2, a))
+        self.assertEqual(rd.frame()[1:], (2, b))
+
+    def test_masked_server_frame_refused(self):
+        # Value: protects=the client rejects server frames carrying the RFC-forbidden mask bit; fails_when=a masked frame is accepted and its payload unmasked wrongly; why_new=server-frame validation was added to fail loud instead of forwarding garbage; seam=none; no_claim=none beyond protects
+        rd = self._read_via(bytes([0x82, 0x80 | 1, 0, 0, 0, 0]) + b"x")
+        with self.assertRaises(ValueError):
+            rd.frame()
+
+    def test_rsv_bits_refused(self):
+        # Value: protects=RSV bits are rejected because no extension was negotiated; fails_when=a frame with extensions is parsed as if plain; why_new=fail-loud protocol validation; seam=none; no_claim=none beyond protects
+        rd = self._read_via(bytes([0x82 | 0x40, 0x02]) + b"ab")
+        with self.assertRaises(ValueError):
+            rd.frame()
+
+    def test_unknown_opcode_refused(self):
+        # Value: protects=opcodes outside the data/control set are rejected instead of silently dropped; fails_when=an unknown opcode is swallowed; why_new=fail-loud protocol validation; seam=none; no_claim=none beyond protects
+        rd = self._read_via(bytes([0x83, 0x02]) + b"ab")
+        with self.assertRaises(ValueError):
+            rd.frame()
+
+    def test_fragmented_control_frame_refused(self):
+        # Value: protects=RFC 6455's fragmented-control-frame prohibition is enforced; fails_when=a fin=0 ping/pong/close is accepted; why_new=control frames must arrive whole; seam=none; no_claim=none beyond protects
+        rd = self._read_via(bytes([0x09, 0x02]) + b"pp")  # ping, fin=0
+        with self.assertRaises(ValueError):
+            rd.frame()
+
+    def test_oversized_control_frame_refused(self):
+        # Value: protects=control frames keep their 125-byte payload cap so our pong echoes stay legal; fails_when=a >125-byte ping is accepted and answered with an oversized pong; why_new=the echo path must not become a protocol violator; seam=none; no_claim=none beyond protects
+        rd = self._read_via(bytes([0x89, 126]) + struct.pack(">H", 130) + b"p" * 130)
+        with self.assertRaises(ValueError):
+            rd.frame()
 
     def test_ping_replies_with_pong_opcode(self):
         captured = {}
@@ -137,6 +173,223 @@ class VvEmissionTests(unittest.TestCase):
         self.assertIn("host=127.0.0.1", written)
 
 
+class BridgeSetupTests(unittest.TestCase):
+    """bridge_and_launch setup/pump behavior with mocked sockets and viewer."""
+
+    # Value: protects=TCP_NODELAY is pinned on the accepted socket, fragmented server messages are reassembled before forwarding, stray continuations kill the session instead of corrupting the stream, and a viewer that dies pre-connect cannot hang the launcher; fails_when=a refactor drops the option, forwards fragments raw, or accepts forever; why_new=these setup behaviors had no coverage; seam=none (ws_connect/Popen/sockets mocked); no_claim=no real TLS, PVE, or viewer behavior
+
+    def _run_bridge(self, tcp, accept_fn, reader):
+        tcp.recv.side_effect = OSError("stop")  # tcp_to_ws exits at once
+        viewer = mock.Mock()
+        viewer.wait.return_value = 0
+        with mock.patch.object(pc, "ws_connect", return_value=(mock.Mock(), b"")), \
+                mock.patch.object(pc, "WsReader", return_value=reader), \
+                mock.patch.object(pc.socket, "socket", return_value=self._listener(accept_fn)), \
+                mock.patch.object(pc.subprocess, "Popen", return_value=viewer), \
+                mock.patch("builtins.open", mock.mock_open()):
+            args = mock.Mock(host="h", node="n", vmid=101, viewer=None,
+                             validate_cert=True)
+            pc.bridge_and_launch({"port": "5900",
+                                  "ticket": "PW:PVEVNC:rest"}, "cookie", args)
+        return tcp, viewer
+
+    def _listener(self, accept_fn):
+        class Listener:
+            def bind(self, a):
+                pass
+
+            def listen(self, n):
+                pass
+
+            def getsockname(self):
+                return ("127.0.0.1", 45678)
+
+            def settimeout(self, t):
+                pass
+
+            def close(self):
+                pass
+
+            def accept(self):
+                return accept_fn()
+
+        return Listener()
+
+    def _settle(self, predicate, timeout=2.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.01)
+        return False
+
+    def test_nodelay_set_on_accepted_socket(self):
+        reader = mock.Mock()
+        reader.frame.side_effect = EOFError  # ws_to_tcp exits at once
+        tcp = mock.Mock()
+        tcp, _ = self._run_bridge(tcp, lambda: (tcp, ("127.0.0.1", 1)), reader)
+        tcp.setsockopt.assert_called_once_with(
+            socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def test_fragmented_message_reassembled_before_forwarding(self):
+        reader = mock.Mock()
+        reader.frame.side_effect = [
+            (False, 2, b"AAA"),
+            (True, 0, b"BBB"),
+            EOFError,
+        ]
+        tcp = mock.Mock()
+        tcp, _ = self._run_bridge(tcp, lambda: (tcp, ("127.0.0.1", 1)), reader)
+        self.assertTrue(self._settle(lambda: tcp.sendall.call_args_list))
+        tcp.sendall.assert_called_once_with(b"AAABBB")
+
+    def test_stray_continuation_terminates_session(self):
+        reader = mock.Mock()
+        reader.frame.side_effect = [(True, 0, b"junk"), EOFError]
+        tcp = mock.Mock()
+        tcp, _ = self._run_bridge(tcp, lambda: (tcp, ("127.0.0.1", 1)), reader)
+        self.assertTrue(self._settle(lambda: tcp.shutdown.call_args_list))
+        tcp.sendall.assert_not_called()
+
+    def test_reassembly_is_capped(self):
+        # Value: protects=reassembly cannot grow without bound on a hostile frame stream; fails_when=fragments accumulate past MAX_MESSAGE_BYTES; why_new=the per-frame 16 MiB limit does not bound a message; seam=none; no_claim=none beyond protects
+        reader = mock.Mock()
+        reader.frame.side_effect = [
+            (False, 2, b"A" * 4),
+            (True, 0, b"B" * 8),
+            EOFError,
+        ]
+        tcp = mock.Mock()
+        with mock.patch.object(pc, "_WS_MAX_MESSAGE_BYTES", 8):
+            tcp, _ = self._run_bridge(tcp, lambda: (tcp, ("127.0.0.1", 1)), reader)
+        self.assertTrue(self._settle(lambda: tcp.shutdown.call_args_list))
+        tcp.sendall.assert_not_called()
+
+    def test_empty_first_fragment_reassembles(self):
+        # Value: protects=an empty first fragment still counts as a started message; fails_when=buffer-emptiness is used as the reassembly sentinel; why_new=the sentinel regression would tear down legal sessions; seam=none; no_claim=none beyond protects
+        reader = mock.Mock()
+        reader.frame.side_effect = [
+            (False, 2, b""),
+            (True, 0, b"x"),
+            EOFError,
+        ]
+        tcp = mock.Mock()
+        tcp, _ = self._run_bridge(tcp, lambda: (tcp, ("127.0.0.1", 1)), reader)
+        self.assertTrue(self._settle(lambda: tcp.sendall.call_args_list))
+        tcp.sendall.assert_called_once_with(b"x")
+
+    def test_overlapping_fragment_start_rejected(self):
+        # Value: protects=a new fragmented message during reassembly aborts the session instead of silently discarding the partial one; fails_when=the partial message is overwritten and the viewer renders corrupt output; why_new=silent stream corruption class; seam=none; no_claim=none beyond protects
+        reader = mock.Mock()
+        reader.frame.side_effect = [
+            (False, 2, b"A"),
+            (False, 2, b"B"),
+            EOFError,
+        ]
+        tcp = mock.Mock()
+        tcp, _ = self._run_bridge(tcp, lambda: (tcp, ("127.0.0.1", 1)), reader)
+        self.assertTrue(self._settle(lambda: tcp.shutdown.call_args_list))
+        tcp.sendall.assert_not_called()
+
+    def test_econnaborted_accept_is_retried(self):
+        # Value: protects=a transient ECONNABORTED during accept does not kill the session; fails_when=any accept OSError is treated as fatal; why_new=macOS aborts backlog entries that RST before accept; seam=none; no_claim=none beyond protects
+        reader = mock.Mock()
+        reader.frame.side_effect = EOFError
+        tcp = mock.Mock()
+        accepted = []
+
+        def accept():
+            if not accepted:
+                accepted.append(1)
+                raise OSError(errno.ECONNABORTED, "connection aborted")
+            return (tcp, ("127.0.0.1", 1))
+
+        tcp, _ = self._run_bridge(tcp, accept, reader)
+        tcp.setsockopt.assert_called_once_with(
+            socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+    def test_viewer_death_during_accept_raises(self):
+        reader = mock.Mock()
+        reader.frame.side_effect = EOFError
+        viewer = mock.Mock()
+        viewer.poll.return_value = 0  # viewer already dead
+
+        def accept():
+            raise socket.timeout()
+
+        with mock.patch.object(pc, "ws_connect", return_value=(mock.Mock(), b"")), \
+                mock.patch.object(pc, "WsReader", return_value=reader), \
+                mock.patch.object(pc.socket, "socket", return_value=self._listener(accept)), \
+                mock.patch.object(pc.subprocess, "Popen", return_value=viewer), \
+                mock.patch("builtins.open", mock.mock_open()):
+            args = mock.Mock(host="h", node="n", vmid=101, viewer=None,
+                             validate_cert=True)
+            with self.assertRaises(RuntimeError) as ctx:
+                pc.bridge_and_launch({"port": "5900",
+                                      "ticket": "PW:PVEVNC:rest"}, "cookie", args)
+        self.assertIn("without connecting", str(ctx.exception))
+        viewer.terminate.assert_called_once_with()
+
+
+class WsConnectTests(unittest.TestCase):
+    # Value: protects=the upstream socket disables Nagle before the TLS upgrade; fails_when=the option is dropped or moved after the handshake; why_new=the diff's first NODELAY call site had no coverage; seam=none (create_connection/ssl mocked); no_claim=no real TLS handshake
+
+    def test_nodelay_set_before_tls_wrap(self):
+        raw = mock.Mock()
+        ctx = mock.Mock()
+        ctx.wrap_socket.return_value = raw
+        key = base64.b64encode(b"\x01" * 16).decode()
+        accept = pc.expected_ws_accept(key)
+        response = (
+            "HTTP/1.1 101 Switching Protocols\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+        ).encode()
+        raw.recv.side_effect = [response]
+        with mock.patch.object(pc.socket, "create_connection", return_value=raw), \
+                mock.patch.object(pc.ssl, "create_default_context", return_value=ctx), \
+                mock.patch.object(pc.os, "urandom", return_value=b"\x01" * 16):
+            sock, rest = pc.ws_connect("h", 8006, "n", 1,
+                                       {"port": "5900", "ticket": "T"},
+                                       "cookie", validate_cert=False)
+        self.assertIs(sock, raw)
+        self.assertEqual(rest, b"")
+        raw.setsockopt.assert_called_once_with(
+            socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # The option must be applied before any upgrade I/O happens.
+        setsockopt_pos = raw.mock_calls.index(
+            mock.call.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1))
+        sendall_pos = raw.mock_calls.index(mock.call.sendall(mock.ANY))
+        self.assertLess(setsockopt_pos, sendall_pos,
+                        "NODELAY must be set before the upgrade request")
+
+
+class MintTests(unittest.TestCase):
+    # Value: protects=the one-time VNC ticket never reaches stderr/logs on the mint failure path and missing pvesh keys fail with a diagnostic instead of a bare KeyError; fails_when=pvesh JSON is echoed or a missing key escapes unhandled; why_new=the failure path previously echoed ticket-bearing JSON; seam=none (ssh mocked); no_claim=no real ssh/pvesh behavior
+
+    def _mint_with(self, stdout):
+        with mock.patch.object(pc.subprocess, "check_output",
+                               return_value=stdout):
+            return pc.mint("h", "n", "1")
+
+    def test_failure_path_does_not_echo_output(self):
+        leaky = b'{"ticket":"SECRETONE","port":"5900"}'  # no ticket line
+        with self.assertRaises(RuntimeError) as ctx:
+            self._mint_with(leaky)
+        self.assertNotIn("SECRETONE", str(ctx.exception))
+
+    def test_missing_keys_fail_with_diagnostic(self):
+        out = b'{"ticket":"T"}\nPVE:apiticket'  # port missing
+        with self.assertRaises(RuntimeError) as ctx:
+            self._mint_with(out)
+        self.assertIn("port", str(ctx.exception))
+
+    def test_success_returns_vnc_and_cookie(self):
+        vnc, cookie = self._mint_with(b'{"port":"5900","ticket":"T"}\nPVE:apiticket')
+        self.assertEqual(vnc["ticket"], "T")
+        # The API cookie keeps its PVE: prefix; only the JSON body is parsed.
+        self.assertEqual(cookie, "PVE:apiticket")
+
+
 class ArgTests(unittest.TestCase):
     def test_missing_required_argument_exits(self):
         with self.assertRaises(SystemExit):
@@ -144,11 +397,31 @@ class ArgTests(unittest.TestCase):
 
     def test_minimal_triple_reaches_mint(self):
         # Value: protects=--host/--node/--vmid are all required and sufficient to reach minting; fails_when=argparse rejects a valid triple or ignores a required flag; why_new=contract for the CLI surface; seam=none; no_claim=none beyond protects
-        with mock.patch.object(pc, "mint", side_effect=RuntimeError("stop-here")), \
+        # mint raises ValueError, which main does not translate, so it must
+        # propagate to prove the flow reached minting (RuntimeError now maps
+        # to the one-line exit-2 path).
+        with mock.patch.object(pc, "mint", side_effect=ValueError("stop-here")), \
                 mock.patch.object(pc.signal, "signal"), \
-                self.assertRaises(RuntimeError) as ctx:
+                self.assertRaises(ValueError) as ctx:
             pc.main(["--host", "h", "--node", "n", "--vmid", "1"])
         self.assertEqual(str(ctx.exception), "stop-here")
+
+    def test_runtime_error_prints_one_line_and_exits_2(self):
+        # Value: protects=minting/setup failures surface as a one-line diagnostic with exit 2, not a traceback; fails_when=RuntimeError escapes main; why_new=routine misconfigurations were stacking tracebacks on the wrapper's clean errors; seam=none; no_claim=none beyond protects
+        with mock.patch.object(pc, "mint", side_effect=RuntimeError("boom")), \
+                mock.patch.object(pc.signal, "signal"), \
+                mock.patch("sys.stderr", new=io.StringIO()) as err:
+            rc = pc.main(["--host", "h", "--node", "n", "--vmid", "1"])
+        self.assertEqual(rc, 2)
+        self.assertEqual(err.getvalue(), "error: boom\n")
+
+    def test_validate_cert_alias_still_accepted(self):
+        # Value: protects=the removed --validate-cert flag stays a silent no-op so persisted invocations keep working; fails_when=argparse rejects the old flag with exit 2 before any diagnostic; why_new=the flag's meaning equals the new default; seam=none; no_claim=none beyond protects
+        with mock.patch.object(pc, "mint", side_effect=ValueError("stop-here")), \
+                mock.patch.object(pc.signal, "signal"), \
+                self.assertRaises(ValueError):
+            pc.main(["--host", "h", "--node", "n", "--vmid", "1",
+                     "--validate-cert"])
 
 
 if __name__ == "__main__":
