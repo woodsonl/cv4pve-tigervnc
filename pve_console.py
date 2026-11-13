@@ -128,13 +128,20 @@ def expected_ws_accept(key):
 
 def mint(host, node, vmid):
     """Mint a websocket VNC ticket plus an API session cookie over SSH."""
-    out = subprocess.check_output(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "root@" + host,
-         f"pvesh create /nodes/{shlex.quote(node)}/qemu/{vmid}/vncproxy"
-         " --websocket 1 --output-format json; "
-         "perl -MPVE::AccessControl -e 'print PVE::AccessControl::assemble_ticket(q(root@pam))'"],
-        timeout=30,
-    ).decode()
+    try:
+        out = subprocess.check_output(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "root@" + host,
+             f"pvesh create /nodes/{shlex.quote(node)}/qemu/{vmid}/vncproxy"
+             " --websocket 1 --output-format json; "
+             "perl -MPVE::AccessControl -e 'print PVE::AccessControl::assemble_ticket(q(root@pam))'"],
+            timeout=30,
+        ).decode()
+    except subprocess.CalledProcessError:
+        # ssh's own diagnostic (unreachable, auth refused) is already on our
+        # stderr; add the one-line contract error, not a traceback.
+        raise RuntimeError(f"could not reach {host} over ssh to mint the ticket") from None
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"ssh to {host} timed out minting the ticket") from None
     idx = out.find("\nPVE:")
     if idx < 0:
         # pvesh's JSON body contains the one-time ticket; echo nothing from it.

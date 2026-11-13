@@ -8,6 +8,7 @@ import io
 import os
 import socket
 import struct
+import subprocess
 import time
 import unittest
 from unittest import mock
@@ -388,6 +389,26 @@ class MintTests(unittest.TestCase):
         self.assertEqual(vnc["ticket"], "T")
         # The API cookie keeps its PVE: prefix; only the JSON body is parsed.
         self.assertEqual(cookie, "PVE:apiticket")
+
+    # Regression: ISSUE-001 — ssh failures surfaced as a raw CalledProcessError
+    # traceback instead of the one-line error contract.
+    # Found by /qa on 2026-11-13
+    # Report: .gstack/qa-reports/run-20261113T205424Z
+    # Value: protects=ssh dial/auth failures and pvesh hangs surface as a one-line RuntimeError; fails_when=CalledProcessError or TimeoutExpired escapes mint; why_new=probe 005 reproduced the traceback against an unreachable host; seam=none; no_claim=none beyond protects
+    def test_ssh_failure_translates_to_runtime_error(self):
+        with mock.patch.object(pc.subprocess, "check_output",
+                               side_effect=subprocess.CalledProcessError(255, "ssh")), \
+                self.assertRaises(RuntimeError) as ctx:
+            pc.mint("h", "n", "1")
+        self.assertIn("ssh", str(ctx.exception))
+        self.assertNotIsInstance(ctx.exception, subprocess.CalledProcessError)
+
+    def test_ssh_timeout_translates_to_runtime_error(self):
+        with mock.patch.object(pc.subprocess, "check_output",
+                               side_effect=subprocess.TimeoutExpired("ssh", 30)), \
+                self.assertRaises(RuntimeError) as ctx:
+            pc.mint("h", "n", "1")
+        self.assertIn("timed out", str(ctx.exception))
 
 
 class ArgTests(unittest.TestCase):
