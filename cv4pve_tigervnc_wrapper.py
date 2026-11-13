@@ -569,6 +569,7 @@ def main(argv):
     except OSError as exc:
         sys.stderr.write(f"error: cannot create password file: {exc}\n")
         return 2
+    proc = None
     try:
         # fdopen closes the descriptor on every path out of this block; a raw
         # os.close would leak it if the launch below raised first.
@@ -588,6 +589,14 @@ def main(argv):
         sys.stderr.write(f"error: failed to launch viewer: {exc}\n")
         return 2
     finally:
+        # A signal (SystemExit from the handler) must not orphan the running
+        # viewer with a dead bridge socket: stop it before the password file
+        # goes away. On the normal path wait() already reaped it. Further
+        # signals are ignored so the cleanup tail cannot be abandoned halfway.
+        _SHUTDOWN_STATE["tearing_down"] = True
+        if proc is not None and proc.poll() is None:
+            with contextlib.suppress(OSError):
+                proc.terminate()
         # The password file is the one secret-bearing artifact; a failed
         # unlink here (not the .vv's best-effort delete) is worth saying.
         try:
@@ -596,16 +605,25 @@ def main(argv):
             sys.stderr.write(f"warning: could not delete password file: {exc}\n")
 
 
+_SHUTDOWN_STATE = {"tearing_down": False}
+
+
 def _install_sigterm_handler():
     # Default SIGTERM/SIGINT kill without running finally blocks (SIGINT's
     # KeyboardInterrupt does run them, but dies on a raw traceback); turn both
     # into an exception so the password file cleanup runs and the exit code is
-    # the conventional 128+N.
+    # the conventional 128+N. A repeat signal while the finally is running is
+    # ignored so it cannot abandon the unlink halfway.
     def handler(signum, _frame):
+        if _SHUTDOWN_STATE["tearing_down"]:
+            return
         raise SystemExit(128 + signum)
 
-    signal.signal(signal.SIGTERM, handler)
-    signal.signal(signal.SIGINT, handler)
+    for sig in (signal.SIGTERM, signal.SIGINT, getattr(signal, "SIGHUP", None)):
+        # SIGHUP (terminal close) kills by default disposition without running
+        # any cleanup; it gets the same teardown path as TERM/INT.
+        if sig is not None:
+            signal.signal(sig, handler)
 
 
 if __name__ == "__main__":

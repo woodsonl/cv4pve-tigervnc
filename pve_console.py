@@ -24,8 +24,10 @@ the local listener binds loopback only and accepts a single connection.
 
 import argparse
 import base64
+import errno
 import hashlib
 import json
+import re
 import shlex
 import os
 import signal
@@ -37,9 +39,18 @@ import sys
 import contextlib
 import tempfile
 import threading
+import time
 import urllib.parse
 
-DEFAULT_VIEWER = "/Applications/TigerVNC.app/Contents/MacOS/vncviewer"
+# RFC 6455: control frame payloads are capped at 125 bytes. Both the pong
+# producer and the parser enforce it so the echo path cannot become a
+# protocol violator.
+_WS_CONTROL_MAX = 125
+# One frame is capped at 16 MiB; a fragmented message has no frame-level
+# bound, so reassembly is capped separately at _WS_MAX_MESSAGE_BYTES.
+_WS_FRAME_MAX_BYTES = 16 * 1024 * 1024
+_WS_OP_CONT, _WS_OP_TEXT, _WS_OP_BINARY = 0x0, 0x1, 0x2
+_WS_OP_CLOSE, _WS_OP_PING, _WS_OP_PONG = 0x8, 0x9, 0xA
 
 
 # --------------------------------------------------------------------------
@@ -47,11 +58,17 @@ DEFAULT_VIEWER = "/Applications/TigerVNC.app/Contents/MacOS/vncviewer"
 # --------------------------------------------------------------------------
 
 
-def ws_send_frame(sock, payload, opcode=2):
+def _disable_nagle(sock):
+    # Interactive traffic (viewer input events) must not sit in Nagle's
+    # buffer waiting for an ACK; framebuffer bulk is unaffected.
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+
+def ws_send_frame(sock, payload, opcode=_WS_OP_BINARY):
     """Send one client frame; client frames are always masked."""
     mask = os.urandom(4)
     n = len(payload)
-    if n <= 125:
+    if n <= _WS_CONTROL_MAX:
         header = bytes([0x80 | opcode, 0x80 | n])
     elif n <= 0xFFFF:
         header = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack(">H", n)
@@ -66,7 +83,9 @@ class WsReader:
 
     def __init__(self, sock, initial=b""):
         self.sock = sock
-        self.buf = initial
+        # bytearray: += extends in place; immutable bytes re-copied the whole
+        # accumulated buffer per ~16 KiB TLS record (quadratic per frame).
+        self.buf = bytearray(initial)
 
     def _need(self, n):
         while len(self.buf) < n:
@@ -76,10 +95,20 @@ class WsReader:
             self.buf += chunk
 
     def frame(self):
-        """Return (opcode, payload) for the next frame."""
+        """Return (fin, opcode, payload) for the next frame."""
         self._need(2)
         b1, b2 = self.buf[0], self.buf[1]
+        if b1 & 0x70:
+            raise ValueError("websocket RSV bits set (no extension negotiated)")
+        if b2 & 0x80:
+            raise ValueError("server frames must not be masked")
         opcode = b1 & 0x0F
+        if opcode not in (_WS_OP_CONT, _WS_OP_TEXT, _WS_OP_BINARY,
+                          _WS_OP_CLOSE, _WS_OP_PING, _WS_OP_PONG):
+            raise ValueError(f"unexpected websocket opcode {opcode}")
+        if opcode >= 8 and not (b1 & 0x80):
+            raise ValueError(f"fragmented control frame (opcode {opcode})")
+        fin = bool(b1 & 0x80)
         n, off = b2 & 0x7F, 2
         if n == 126:
             self._need(4)
@@ -89,12 +118,14 @@ class WsReader:
             self._need(10)
             n = struct.unpack(">Q", self.buf[2:10])[0]
             off = 10
-        if n > 16 * 1024 * 1024:
+        if n > _WS_FRAME_MAX_BYTES:
             raise ValueError(f"oversized websocket frame: {n}")
+        if opcode >= 8 and n > _WS_CONTROL_MAX:
+            raise ValueError(f"control frame payload {n} exceeds {_WS_CONTROL_MAX} bytes")
         self._need(off + n)
-        payload = self.buf[off:off + n]
-        self.buf = self.buf[off + n:]
-        return opcode, payload
+        payload = bytes(self.buf[off:off + n])
+        del self.buf[:off + n]  # drop the consumed prefix without re-copying it
+        return fin, opcode, payload
 
 
 # --------------------------------------------------------------------------
@@ -102,6 +133,12 @@ class WsReader:
 # --------------------------------------------------------------------------
 
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+# A fragmented message has no frame-level bound (frames stop at
+# _WS_FRAME_MAX_BYTES); this caps reassembly so a hostile server cannot grow
+# the buffer without limit.
+_WS_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+
 
 
 def expected_ws_accept(key):
@@ -111,34 +148,75 @@ def expected_ws_accept(key):
 
 def mint(host, node, vmid):
     """Mint a websocket VNC ticket plus an API session cookie over SSH."""
-    out = subprocess.check_output(
-        ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "root@" + host,
-         f"pvesh create /nodes/{shlex.quote(node)}/qemu/{vmid}/vncproxy"
-         " --websocket 1 --output-format json; "
-         "perl -MPVE::AccessControl -e 'print PVE::AccessControl::assemble_ticket(q(root@pam))'"],
-        timeout=30,
-    ).decode()
+    try:
+        out = subprocess.check_output(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", "root@" + host,
+             f"pvesh create /nodes/{shlex.quote(node)}/qemu/{vmid}/vncproxy"
+             " --websocket 1 --output-format json; "
+             "perl -MPVE::AccessControl -e 'print PVE::AccessControl::assemble_ticket(q(root@pam))'"],
+            timeout=30,
+        ).decode()
+    except subprocess.CalledProcessError:
+        # ssh's own diagnostic (unreachable, auth refused) is already on our
+        # stderr; add the one-line contract error, not a traceback.
+        raise RuntimeError(f"could not reach {host} over ssh to mint the ticket") from None
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"ssh to {host} timed out minting the ticket") from None
+    except UnicodeDecodeError:
+        # Root banners or locale noise can carry non-UTF-8 bytes; the JSON and
+        # ticket line are ASCII, so anything undecodable is junk around them.
+        raise RuntimeError(f"ssh to {host} produced non-UTF-8 output") from None
     idx = out.find("\nPVE:")
     if idx < 0:
-        raise RuntimeError(f"could not mint ticket on {host}: {out[:120]!r}")
-    return json.loads(out[:idx]), out[idx + 1:].strip()
+        # pvesh's JSON body contains the one-time ticket; echo nothing from it.
+        raise RuntimeError(f"could not mint ticket on {host}: pvesh produced no ticket line")
+    try:
+        vnc = json.loads(out[:idx])
+    except ValueError:
+        # The ticket line without valid JSON means pvesh changed or broke; the
+        # body may hold the ticket, so echo nothing.
+        raise RuntimeError(f"pvesh on {host} returned a non-JSON ticket response") from None
+    if not isinstance(vnc, dict):
+        raise RuntimeError(f"pvesh on {host} returned unexpected JSON")
+    missing = [k for k in ("port", "ticket") if not vnc.get(k)]
+    if missing:
+        raise RuntimeError(f"pvesh response is missing {', '.join(missing)}")
+    api_ticket = out[idx + 1:].strip()
+    # The cookie becomes a request header; non-printable remote output must
+    # not reach it (an embedded newline would smuggle request lines).
+    if not re.fullmatch(r"[\x21-\x7e]+", api_ticket):
+        raise RuntimeError(f"ssh to {host} produced an unusable ticket cookie")
+    return vnc, api_ticket
 
 
 def ws_connect(host, port, node, vmid, vnc, api_ticket, validate_cert):
     raw = socket.create_connection((host, port), timeout=10)
+    _disable_nagle(raw)
     ctx = ssl.create_default_context()
     if validate_cert:
         ctx.verify_mode = ssl.CERT_REQUIRED
         ctx.check_hostname = True
     else:
-        # The session cookie rides this connection; an unvalidated certificate
-        # means a man in the middle could read it. Kept off by default because
-        # self-signed hosts are the norm for PVE, same default as cv4pve-vdi.
+        # The root session cookie rides this connection; an unvalidated
+        # certificate means a man in the middle could read it. Only reached
+        # with explicit --insecure, because self-signed hosts are the norm
+        # for PVE.
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
-        print("warning: certificate validation off; the session cookie is "
-              "sent unvalidated", file=sys.stderr)
-    sock = ctx.wrap_socket(raw, server_hostname=host)
+        print("warning: certificate validation off; the root session cookie "
+              "is sent unvalidated (--insecure)", file=sys.stderr)
+    try:
+        sock = ctx.wrap_socket(raw, server_hostname=host)
+    except ssl.SSLCertVerificationError:
+        raise RuntimeError(
+            f"TLS certificate validation failed for {host}; pass --insecure "
+            "if the host uses a self-signed certificate") from None
+    except ssl.SSLError as exc:
+        # A non-certificate handshake failure (downgrade, cipher mismatch, a
+        # plain-HTTP port) must not coach the user into disabling validation;
+        # an active MITM could be the cause.
+        raise RuntimeError(
+            f"TLS handshake with {host} failed: {_printable(str(exc))}") from None
     key = base64.b64encode(os.urandom(16)).decode()
     q = urllib.parse.urlencode({"port": vnc["port"], "vncticket": vnc["ticket"]})
     request = (
@@ -164,9 +242,13 @@ def ws_connect(host, port, node, vmid, vnc, api_ticket, validate_cert):
         buf += chunk
     sock.settimeout(None)  # only a confirmed session may block indefinitely
     head, _, rest = buf.partition(b"\r\n\r\n")
-    status = head.split(b"\r\n")[0].decode("latin-1")
-    if " 101 " not in status:
-        raise RuntimeError(f"websocket upgrade refused: {status}")
+    status_line = head.split(b"\r\n")[0].decode("latin-1")
+    parts = status_line.split(" ", 2)
+    code = parts[1] if len(parts) > 1 else ""
+    if code != "101":
+        # Parse the code by position: a server-controlled reason phrase may
+        # contain " 101 " anywhere.
+        raise RuntimeError(f"websocket upgrade refused: {_printable(status_line)}")
     accept = None
     for line in head.split(b"\r\n")[1:]:
         name, _, value = line.partition(b":")
@@ -211,103 +293,198 @@ def bridge_and_launch(vnc, api_ticket, args):
             os.unlink(vv_path)
         with contextlib.suppress(OSError):
             os.rmdir(vv_dir)
-        with contextlib.suppress(OSError):
-            os.rmdir(vv_dir)
         listener.close()
         sock.close()
         raise
     tcp = None
     try:
-        tcp, _ = listener.accept()
-    except OSError:
-        viewer.terminate()
-        with contextlib.suppress(OSError):
-            os.unlink(vv_path)
-        with contextlib.suppress(OSError):
-            os.rmdir(vv_dir)
-        with contextlib.suppress(OSError):
-            os.rmdir(vv_dir)
-        listener.close()
-        sock.close()
-        raise
-    tcp.settimeout(None)
-    print(f"console: VM {args.vmid} on 127.0.0.1:{local_port}", file=sys.stderr)
+        # A viewer that exits without connecting must not hang the launcher:
+        # poll it while waiting for the bridge connection. A connection that
+        # aborts before accept (ECONNABORTED) is transient; keep waiting.
+        listener.settimeout(1)
+        while tcp is None:
+            try:
+                tcp, _ = listener.accept()
+                continue  # connected: skip the liveness check below
+            except socket.timeout:
+                pass
+            except OSError as exc:
+                if exc.errno != errno.ECONNABORTED:
+                    raise
+                # A sustained abort flood must not spin the loop: back off.
+                time.sleep(0.1)
+            if viewer.poll() is not None:
+                raise RuntimeError(
+                    "viewer exited without connecting to the console bridge"
+                ) from None
+        listener.settimeout(None)
+        _disable_nagle(tcp)
+        tcp.settimeout(None)
+        print(f"console: VM {args.vmid} on 127.0.0.1:{local_port}", file=sys.stderr)
 
-    def ws_to_tcp():
-        try:
-            while True:
-                opcode, payload = reader.frame()
-                if opcode == 8:
-                    break
-                if opcode == 9:
-                    ws_send(payload, 0xA)
-                    continue
-                if opcode in (1, 2) and payload:
-                    tcp.sendall(payload)
-        except (EOFError, OSError):
-            pass
-        finally:
-            # The session is over from the server side; make sure the viewer
-            # sees it too instead of freezing on its last framebuffer.
-            with contextlib.suppress(OSError):
-                tcp.shutdown(socket.SHUT_RDWR)
-            tcp.close()
+        def ws_to_tcp():
+            # Reassembly state: frag_op is None whenever no fragmented
+            # message is in progress. The buffer alone cannot be the sentinel
+            # because a legal first fragment may be empty.
+            try:
+                frag_op = None
+                frag = bytearray()
+                while True:
+                    fin, opcode, payload = reader.frame()
+                    if opcode == _WS_OP_CLOSE:
+                        break
+                    if opcode == _WS_OP_PING:
+                        ws_send(payload, _WS_OP_PONG)
+                        continue
+                    if opcode == _WS_OP_PONG:
+                        continue
+                    if opcode in (_WS_OP_TEXT, _WS_OP_BINARY):
+                        if frag_op is not None:
+                            # RFC 6455 5.4: only control frames may interleave
+                            # with a fragmented message; accepting a complete
+                            # data frame here would reorder server bytes.
+                            raise ValueError(
+                                "data frame during message reassembly")
+                        if not fin:
+                            frag_op, frag = opcode, bytearray(payload)
+                            continue
+                    elif opcode == _WS_OP_CONT:
+                        if frag_op is None:
+                            raise ValueError(
+                                "continuation frame without a started message")
+                        frag += payload
+                        if len(frag) > _WS_MAX_MESSAGE_BYTES:
+                            raise ValueError(
+                                "fragmented message exceeds "
+                                f"{_WS_MAX_MESSAGE_BYTES} bytes")
+                        if not fin:
+                            continue
+                        payload, opcode = bytes(frag), frag_op
+                        frag_op, frag = None, bytearray()
+                    if payload:
+                        tcp.sendall(payload)
+            except ValueError as exc:
+                # A protocol violation must be diagnosable, not silent: the
+                # viewer just sees a dead socket otherwise.
+                print(f"console: protocol error, ending session: {exc}",
+                      file=sys.stderr)
+            except (EOFError, OSError):
+                pass
+            finally:
+                # The session is over from the server side; make sure the
+                # viewer sees it too instead of freezing on its last
+                # framebuffer.
+                with contextlib.suppress(OSError):
+                    tcp.shutdown(socket.SHUT_RDWR)
+                tcp.close()
 
-    def tcp_to_ws():
-        try:
-            while True:
-                data = tcp.recv(65536)
-                if not data:
-                    break
-                ws_send(data)
-        except OSError:
-            pass
-        finally:
-            with contextlib.suppress(OSError):
-                ws_send(b"", 8)
+        def tcp_to_ws():
+            try:
+                while True:
+                    data = tcp.recv(65536)
+                    if not data:
+                        break
+                    ws_send(data)
+            except OSError:
+                pass
+            finally:
+                with contextlib.suppress(OSError):
+                    ws_send(b"", _WS_OP_CLOSE)
 
-    ws_lock = threading.Lock()
+        ws_lock = threading.Lock()
 
-    def ws_send(data, opcode=2):
-        with ws_lock:
-            ws_send_frame(sock, data, opcode)
+        def ws_send(data, opcode=_WS_OP_BINARY):
+            with ws_lock:
+                ws_send_frame(sock, data, opcode)
 
-    pumps = [threading.Thread(target=ws_to_tcp, daemon=True),
-             threading.Thread(target=tcp_to_ws, daemon=True)]
-    for t in pumps:
-        t.start()
-    try:
+        pumps = [threading.Thread(target=ws_to_tcp, daemon=True),
+                 threading.Thread(target=tcp_to_ws, daemon=True)]
+        for t in pumps:
+            t.start()
         return viewer.wait()
+    except BaseException:
+        # The viewer is already running; any failure between launch and
+        # steady state must not orphan it with the bridge still live.
+        with contextlib.suppress(OSError):
+            viewer.terminate()
+        raise
     finally:
         # Teardown on every path: close the local socket first so the viewer
         # cannot be left painting a dead session, then the websocket.
+        # shutdown before close so a pump parked in recv is reliably woken.
+        # Signals are ignored from here so a repeat TERM/Ctrl-C cannot abort
+        # the cleanup tail (the .vv unlink) once this store lands; the few
+        # bytecodes before it remain a documented window.
+        _SHUTDOWN_STATE["tearing_down"] = True
+        if tcp is not None:
+            with contextlib.suppress(OSError):
+                tcp.shutdown(socket.SHUT_RDWR)
         with contextlib.suppress(OSError):
-            tcp.shutdown(socket.SHUT_RDWR)
-        listener.close()
-        sock.close()
+            listener.close()
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError):
+            sock.close()
         with contextlib.suppress(OSError):
             os.unlink(vv_path)
         with contextlib.suppress(OSError):
             os.rmdir(vv_dir)
+
+
+_SHUTDOWN_STATE = {"tearing_down": False}
+
+
+def _on_signal(signum, _frame):
+    # A second signal while the teardown finally runs must not abandon the
+    # remaining cleanup (the .vv unlink); ignore it instead.
+    if _SHUTDOWN_STATE["tearing_down"]:
+        return
+    raise SystemExit(128 + signum)
+
+
+def _node_name(value):
+    # PVE node names are DNS-label shaped; validating here keeps the value
+    # safe for both the ssh command and the HTTP request line.
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}", value):
+        raise argparse.ArgumentTypeError(f"invalid node name: {value!r}")
+    return value
+
+
+def _printable(text, limit=120):
+    # Server-controlled bytes must not reach stderr wearing terminal escapes
+    # (they could spoof diagnostics or mask a MITM warning).
+    return "".join(c if 0x20 <= ord(c) < 0x7F else "?" for c in text)[:limit]
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--host", required=True, help="PVE host address")
-    ap.add_argument("--node", required=True, help="cluster node name")
+    ap.add_argument("--node", required=True, type=_node_name, help="cluster node name")
     ap.add_argument("--vmid", required=True, type=int, help="VM id")
     ap.add_argument("--port", type=int, default=8006, help="pveproxy port")
     ap.add_argument("--viewer", default=None,
                     help="viewer binary (default: the wrapper's TigerVNC path)")
-    ap.add_argument("--validate-cert", action="store_true",
-                    help="validate the PVE TLS certificate (self-signed by default)")
+    ap.add_argument("--insecure", action="store_true",
+                    help="skip TLS certificate validation for self-signed PVE "
+                         "hosts; the root session cookie then rides an "
+                         "unvalidated connection")
     args = ap.parse_args(argv)
 
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-    signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
+    for sig in (signal.SIGTERM, signal.SIGINT, getattr(signal, "SIGHUP", None)):
+        # SIGHUP (terminal close) kills by default disposition without running
+        # any cleanup; it gets the same teardown path as TERM/INT.
+        if sig is not None:
+            signal.signal(sig, _on_signal)
 
-    vnc, api_ticket = mint(args.host, args.node, args.vmid)
-    return bridge_and_launch(vnc, api_ticket, args)
+    try:
+        vnc, api_ticket = mint(args.host, args.node, args.vmid)
+        args.validate_cert = not args.insecure
+        return bridge_and_launch(vnc, api_ticket, args)
+    except (RuntimeError, OSError) as exc:
+        # Minting, connection, and setup failures are one-line diagnostics,
+        # not tracebacks.
+        sys.stderr.write(f"error: {exc}\n")
+        return 2
 
 
 if __name__ == "__main__":

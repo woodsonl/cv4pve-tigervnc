@@ -35,7 +35,9 @@ the websocket itself, and runs the wrapper. It exists because cv4pve-vdi's
 bridge stops relaying viewer input while the screen keeps updating, so its
 consoles can render but accept no input; the standalone launcher relays both
 directions until the viewer exits, and closes the viewer's socket the moment
-the session ends so no window is left painting a dead console.
+the session ends so no window is left painting a dead console. TLS certificate
+validation is on by default; pass `--insecure` for a self-signed host (the
+root session cookie then rides an unvalidated connection).
 
 
 Then in cv4pve-vdi, under Settings → Launchers:
@@ -97,10 +99,13 @@ once the session is over. `kill -TERM` and normal exit are both covered.
 The wrapper has to stay alive for the whole session. cv4pve-vdi's
 `RemoteViewerService` disposes the bridge when the process it launched exits,
 so a wrapper that exits after spawning the viewer would take the console down
-with it. `SIGTERM` and `SIGINT` are turned into a `SystemExit` of 128+N so the
-password file gets removed on that path too. The wrapper does not kill the
-viewer on those signals: the viewer dies on its own a moment later when
-cv4pve-vdi disposes the bridge, which is the designed teardown.
+with it. `SIGTERM`, `SIGINT`, and `SIGHUP` are turned into a `SystemExit` of
+128+N so the password file gets removed on that path too, and a viewer still
+running at that point is terminated first: a dead bridge must not leave a
+live console painting a session that no longer exists. On the normal path the
+wrapper does not kill the viewer; it waits, and the viewer dies on its own a
+moment later when cv4pve-vdi disposes the bridge, which is the designed
+teardown.
 
 Two more behaviors worth knowing: the wrapper deletes whatever file path it is
 given before validating it (cv4pve-vdi hands it a temp file it just wrote; do
@@ -177,7 +182,7 @@ viewer. So:
 python3 -m unittest test_cv4pve_tigervnc_wrapper
 ```
 
-46 tests, no network, and TigerVNC is never started: `main()` is driven
+48 tests, no network, and TigerVNC is never started: `main()` is driven
 end to end against `/bin/sh` stubs. One stub records the password file's bytes
 and mode, proving the file holds exactly `vncpasswd_obfuscate(ticket)` and
 nothing else; another exits 7 to prove the child's exit code passes through;
