@@ -698,6 +698,8 @@ class LaunchTests(unittest.TestCase):
             self.assertEqual(first.exception.code, 143)
             w._SHUTDOWN_STATE["tearing_down"] = True
             handler(signal.SIGTERM, None)  # must not raise
+            # SIGHUP (terminal close) must be wired to the same teardown path.
+            self.assertIs(signal.getsignal(signal.SIGHUP), handler)
         finally:
             signal.signal(signal.SIGTERM, old_handlers[0])
             signal.signal(signal.SIGINT, old_handlers[1])

@@ -619,8 +619,11 @@ def _install_sigterm_handler():
             return
         raise SystemExit(128 + signum)
 
-    signal.signal(signal.SIGTERM, handler)
-    signal.signal(signal.SIGINT, handler)
+    for sig in (signal.SIGTERM, signal.SIGINT, getattr(signal, "SIGHUP", None)):
+        # SIGHUP (terminal close) kills by default disposition without running
+        # any cleanup; it gets the same teardown path as TERM/INT.
+        if sig is not None:
+            signal.signal(sig, handler)
 
 
 if __name__ == "__main__":

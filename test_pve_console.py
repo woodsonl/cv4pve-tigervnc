@@ -8,6 +8,7 @@ import base64
 import errno
 import io
 import os
+import signal
 import socket
 import ssl
 import struct
@@ -643,6 +644,44 @@ class WsConnectTests(unittest.TestCase):
                           "cookie", validate_cert=True)
         self.assertNotIn("--insecure", str(caught.exception))
         self.assertIn("TLS handshake", str(caught.exception))
+
+    # Regression: ship adversarial pass — the upgrade gate matched " 101 "
+    # anywhere in the status line, so a reason phrase containing it passed.
+    # Found by /ship adversarial review on 2026-11-13
+    # Report: .gstack/qa-reports/run-20261113T205424Z
+    # Value: protects=the upgrade verdict parses the status code by position; fails_when=a non-101 response with 101 inside its reason phrase passes the gate; why_new=the gate was a substring hunt behind a real accept-key check; seam=none; no_claim=the accept-key check still stops an actual impostor
+    def test_upgrade_refusal_parses_code_by_position(self):
+        raw, ctx = mock.Mock(), mock.Mock()
+        ctx.wrap_socket.return_value = raw
+        key = base64.b64encode(b"\x01" * 16).decode()
+        accept = pc.expected_ws_accept(key)
+        response = (
+            "HTTP/1.1 500 Internal 101 Error\r\n"
+            f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+        ).encode()
+        raw.recv.side_effect = [response]
+        with mock.patch.object(pc.socket, "create_connection", return_value=raw), \
+                mock.patch.object(pc.ssl, "create_default_context", return_value=ctx), \
+                mock.patch.object(pc.os, "urandom", return_value=b"\x01" * 16), \
+                self.assertRaises(RuntimeError) as caught:
+            pc.ws_connect("h", 8006, "n", 1, {"port": "5900", "ticket": "T"},
+                          "cookie", validate_cert=True)
+        self.assertIn("refused", str(caught.exception))
+
+    def test_sighup_gets_the_teardown_handler(self):
+        # Regression: ship adversarial pass — terminal close (SIGHUP) kept the
+        # default disposition and skipped every cleanup path.
+        # Found by /ship adversarial review on 2026-11-13
+        # Report: .gstack/qa-reports/run-20261113T205424Z
+        # Value: protects=the most common abrupt death runs the teardown; fails_when=SIGHUP keeps its default kill disposition; why_new=only TERM/INT were wired; seam=none; no_claim=no real signal delivery
+        with mock.patch.object(pc, "mint", side_effect=ValueError("stop")), \
+                mock.patch.object(pc.signal, "signal") as install, \
+                self.assertRaises(ValueError):
+            pc.main(["--host", "h", "--node", "pve", "--vmid", "1"])
+        installed = {c.args[0]: c.args[1] for c in install.call_args_list}
+        self.assertIs(installed[signal.SIGTERM], pc._on_signal)
+        self.assertIs(installed[signal.SIGINT], pc._on_signal)
+        self.assertIs(installed[signal.SIGHUP], pc._on_signal)
 
 
 class MintTests(unittest.TestCase):

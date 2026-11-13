@@ -181,7 +181,12 @@ def mint(host, node, vmid):
     missing = [k for k in ("port", "ticket") if not vnc.get(k)]
     if missing:
         raise RuntimeError(f"pvesh response is missing {', '.join(missing)}")
-    return vnc, out[idx + 1:].strip()
+    api_ticket = out[idx + 1:].strip()
+    # The cookie becomes a request header; non-printable remote output must
+    # not reach it (an embedded newline would smuggle request lines).
+    if not re.fullmatch(r"[\x21-\x7e]+", api_ticket):
+        raise RuntimeError(f"ssh to {host} produced an unusable ticket cookie")
+    return vnc, api_ticket
 
 
 def ws_connect(host, port, node, vmid, vnc, api_ticket, validate_cert):
@@ -210,7 +215,8 @@ def ws_connect(host, port, node, vmid, vnc, api_ticket, validate_cert):
         # A non-certificate handshake failure (downgrade, cipher mismatch, a
         # plain-HTTP port) must not coach the user into disabling validation;
         # an active MITM could be the cause.
-        raise RuntimeError(f"TLS handshake with {host} failed: {exc}") from None
+        raise RuntimeError(
+            f"TLS handshake with {host} failed: {_printable(str(exc))}") from None
     key = base64.b64encode(os.urandom(16)).decode()
     q = urllib.parse.urlencode({"port": vnc["port"], "vncticket": vnc["ticket"]})
     request = (
@@ -236,12 +242,13 @@ def ws_connect(host, port, node, vmid, vnc, api_ticket, validate_cert):
         buf += chunk
     sock.settimeout(None)  # only a confirmed session may block indefinitely
     head, _, rest = buf.partition(b"\r\n\r\n")
-    status = head.split(b"\r\n")[0].decode("latin-1")
-    if " 101 " not in status:
-        # Server-controlled bytes: strip anything that is not printable ASCII
-        # (terminal escapes could spoof diagnostics) before it hits stderr.
-        clean = "".join(c if 0x20 <= ord(c) < 0x7F else "?" for c in status)[:120]
-        raise RuntimeError(f"websocket upgrade refused: {clean}")
+    status_line = head.split(b"\r\n")[0].decode("latin-1")
+    parts = status_line.split(" ", 2)
+    code = parts[1] if len(parts) > 1 else ""
+    if code != "101":
+        # Parse the code by position: a server-controlled reason phrase may
+        # contain " 101 " anywhere.
+        raise RuntimeError(f"websocket upgrade refused: {_printable(status_line)}")
     accept = None
     for line in head.split(b"\r\n")[1:]:
         name, _, value = line.partition(b":")
@@ -411,10 +418,12 @@ def bridge_and_launch(vnc, api_ticket, args):
         if tcp is not None:
             with contextlib.suppress(OSError):
                 tcp.shutdown(socket.SHUT_RDWR)
-        listener.close()
+        with contextlib.suppress(OSError):
+            listener.close()
         with contextlib.suppress(OSError):
             sock.shutdown(socket.SHUT_RDWR)
-        sock.close()
+        with contextlib.suppress(OSError):
+            sock.close()
         with contextlib.suppress(OSError):
             os.unlink(vv_path)
         with contextlib.suppress(OSError):
@@ -440,6 +449,12 @@ def _node_name(value):
     return value
 
 
+def _printable(text, limit=120):
+    # Server-controlled bytes must not reach stderr wearing terminal escapes
+    # (they could spoof diagnostics or mask a MITM warning).
+    return "".join(c if 0x20 <= ord(c) < 0x7F else "?" for c in text)[:limit]
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--host", required=True, help="PVE host address")
@@ -454,8 +469,11 @@ def main(argv=None):
                          "unvalidated connection")
     args = ap.parse_args(argv)
 
-    signal.signal(signal.SIGTERM, _on_signal)
-    signal.signal(signal.SIGINT, _on_signal)
+    for sig in (signal.SIGTERM, signal.SIGINT, getattr(signal, "SIGHUP", None)):
+        # SIGHUP (terminal close) kills by default disposition without running
+        # any cleanup; it gets the same teardown path as TERM/INT.
+        if sig is not None:
+            signal.signal(sig, _on_signal)
 
     try:
         vnc, api_ticket = mint(args.host, args.node, args.vmid)
