@@ -413,7 +413,8 @@ def bridge_and_launch(vnc, api_ticket, args):
         # cannot be left painting a dead session, then the websocket.
         # shutdown before close so a pump parked in recv is reliably woken.
         # Signals are ignored from here so a repeat TERM/Ctrl-C cannot abort
-        # the cleanup tail (the .vv unlink) halfway.
+        # the cleanup tail (the .vv unlink) once this store lands; the few
+        # bytecodes before it remain a documented window.
         _SHUTDOWN_STATE["tearing_down"] = True
         if tcp is not None:
             with contextlib.suppress(OSError):
