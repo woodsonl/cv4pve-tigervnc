@@ -146,7 +146,12 @@ def mint(host, node, vmid):
     if idx < 0:
         # pvesh's JSON body contains the one-time ticket; echo nothing from it.
         raise RuntimeError(f"could not mint ticket on {host}: pvesh produced no ticket line")
-    vnc = json.loads(out[:idx])
+    try:
+        vnc = json.loads(out[:idx])
+    except ValueError:
+        # The ticket line without valid JSON means pvesh changed or broke; the
+        # body may hold the ticket, so echo nothing.
+        raise RuntimeError(f"pvesh on {host} returned a non-JSON ticket response") from None
     missing = [k for k in ("port", "ticket") if not vnc.get(k)]
     if missing:
         raise RuntimeError(f"pvesh response is missing {', '.join(missing)}")
@@ -171,7 +176,12 @@ def ws_connect(host, port, node, vmid, vnc, api_ticket, validate_cert):
         ctx.verify_mode = ssl.CERT_NONE
         print("warning: certificate validation off; the root session cookie "
               "is sent unvalidated (--insecure)", file=sys.stderr)
-    sock = ctx.wrap_socket(raw, server_hostname=host)
+    try:
+        sock = ctx.wrap_socket(raw, server_hostname=host)
+    except ssl.SSLError:
+        raise RuntimeError(
+            f"TLS certificate validation failed for {host}; pass --insecure "
+            "if the host uses a self-signed certificate") from None
     key = base64.b64encode(os.urandom(16)).decode()
     q = urllib.parse.urlencode({"port": vnc["port"], "vncticket": vnc["ticket"]})
     request = (
@@ -395,8 +405,9 @@ def main(argv=None):
         vnc, api_ticket = mint(args.host, args.node, args.vmid)
         args.validate_cert = not args.insecure
         return bridge_and_launch(vnc, api_ticket, args)
-    except RuntimeError as exc:
-        # Minting and setup failures are one-line diagnostics, not tracebacks.
+    except (RuntimeError, OSError) as exc:
+        # Minting, connection, and setup failures are one-line diagnostics,
+        # not tracebacks.
         sys.stderr.write(f"error: {exc}\n")
         return 2
 

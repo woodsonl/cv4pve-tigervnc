@@ -603,6 +603,24 @@ class LaunchTests(unittest.TestCase):
         residue = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(".pve-vnc-passwd-")]
         self.assertEqual(residue, [])
 
+    def test_normal_exit_does_not_terminate_viewer(self):
+        # Value: protects=the finally-block viewer guard only fires for a still-running child, so a normally reaped viewer is never signaled; fails_when=the poll() guard is dropped and terminate() is called on every session end; why_new=the guard was added with the SIGTERM orphan fix and only its terminate branch had coverage; seam=none (Popen mocked, real stub viewer on disk); no_claim=no real viewer behavior
+        stub = os.path.join(tempfile.mkdtemp(), "stub_viewer")
+        with open(stub, "w") as fh:
+            fh.write("#!/bin/sh\nexit 0\n")
+        os.chmod(stub, stat.S_IRWXU)
+        vv_path = valid_vv()
+        proc = mock.Mock()
+        proc.wait.return_value = 0
+        proc.poll.return_value = 0  # already reaped by wait()
+        with mock.patch.dict(os.environ, {w.VIEWER_ENV_OVERRIDE: stub}), \
+                mock.patch.object(w.subprocess, "Popen", return_value=proc):
+            rc = w.main([vv_path])
+        self.assertEqual(rc, 0)
+        proc.terminate.assert_not_called()
+        residue = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(".pve-vnc-passwd-")]
+        self.assertEqual(residue, [])
+
     def test_sigterm_exits_143_and_cleans_passwd_file(self):
         # Value: protects=SIGTERM routes through the finally block, terminating the running viewer, deleting the password file, and exiting 143; fails_when=_install_sigterm_handler is not installed, the finally cleanup is lost, or the viewer child is orphaned with a dead bridge socket; why_new=the handler was the only product path with zero tests and carries the no-ticket-file-left promise; seam=none; no_claim=none beyond protects, real subprocess
         # protects: the SIGTERM->SystemExit(128+15) handler. When cv4pve-vdi
