@@ -678,6 +678,29 @@ class LaunchTests(unittest.TestCase):
         residue = [f for f in os.listdir(tempfile.gettempdir()) if f.startswith(".pve-vnc-passwd-")]
         self.assertEqual(residue, [])
 
+    def test_repeat_signal_during_teardown_ignored(self):
+        # Regression: pre-landing review — the wrapper's handler raised
+        # unconditionally, so a second signal inside the finally abandoned the
+        # passwd-file unlink halfway (the launcher got this guard first).
+        # Found by /ship maintainability review on 2026-11-13
+        # Report: .gstack/qa-reports/run-20261113T205424Z
+        # Value: protects=a repeat TERM/Ctrl-C cannot skip the password-file cleanup; fails_when=the wrapper handler raises while the teardown flag is set; why_new=the guard existed only in pve_console; seam=none; no_claim=no real signal delivery
+        old_handler = signal.getsignal(signal.SIGTERM)
+        old_flag = w._SHUTDOWN_STATE["tearing_down"]
+        try:
+            # Earlier in-process tests arm the flag in main's finally.
+            w._SHUTDOWN_STATE["tearing_down"] = False
+            w._install_sigterm_handler()
+            handler = signal.getsignal(signal.SIGTERM)
+            with self.assertRaises(SystemExit) as first:
+                handler(signal.SIGTERM, None)
+            self.assertEqual(first.exception.code, 143)
+            w._SHUTDOWN_STATE["tearing_down"] = True
+            handler(signal.SIGTERM, None)  # must not raise
+        finally:
+            signal.signal(signal.SIGTERM, old_handler)
+            w._SHUTDOWN_STATE["tearing_down"] = old_flag
+
     def test_sigint_exits_130_and_cleans_passwd_file(self):
         # SIGINT arrives as KeyboardInterrupt by default: cleanup runs, but the
         # process dies on a raw traceback with an interpreter-chosen status.

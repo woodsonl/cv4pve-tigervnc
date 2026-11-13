@@ -145,12 +145,15 @@ class FrameCodecTests(unittest.TestCase):
 
 
 class VvEmissionTests(unittest.TestCase):
-    # Value: protects=the .vv handed to the wrapper carries the bridge's local port and the full prefixed ticket; fails_when=the vv loses the ticket or points at the wrong port; why_new=the wrapper's own tests only cover .vvs built by cv4pve-vdi; seam=none (ws_connect mocked); no_claim=network behavior, websocket is mocked
+    # Value: protects=the .vv handed to the wrapper carries the bridge's local port and the full prefixed ticket, and a viewer-launch failure runs the cleanup branch; fails_when=the vv loses the ticket, points at the wrong port, or the OSError cleanup stops closing sockets; why_new=the wrapper's own tests only cover .vvs built by cv4pve-vdi, and the cleanup branch lost a duplicated rmdir in this diff; seam=none (ws_connect mocked); no_claim=network behavior, websocket is mocked
     def test_vv_carries_ticket_and_local_port(self):
         captured = {}
+        closes = []
+
+        ws_sock = mock.Mock()
 
         def fake_ws_connect(*args, **kwargs):
-            return mock.Mock(), b""
+            return ws_sock, b""
 
         class Listener:
             def bind(self, a):
@@ -166,7 +169,7 @@ class VvEmissionTests(unittest.TestCase):
                 return ("127.0.0.1", 45678)
 
             def close(self):
-                pass
+                closes.append("listener")
 
         def fake_open(path, mode="r", *a, **k):
             captured.setdefault("writes", []).append(
@@ -177,10 +180,10 @@ class VvEmissionTests(unittest.TestCase):
         m = mock.mock_open()
         with mock.patch.object(pc, "ws_connect", side_effect=fake_ws_connect), \
                 mock.patch.object(pc.socket, "socket", return_value=Listener()), \
-                mock.patch.object(pc.subprocess, "Popen", side_effect=RuntimeError("stop")), \
+                mock.patch.object(pc.subprocess, "Popen", side_effect=OSError("no viewer")), \
                 mock.patch("builtins.open", m):
             args = mock.Mock(host="h", node="n", vmid=101, viewer=None)
-            with self.assertRaises(RuntimeError):
+            with self.assertRaises(OSError):
                 pc.bridge_and_launch({"port": "5900",
                                       "ticket": "PW:PVEVNC:rest"}, "cookie", args)
         written = "".join(c.args[0] for c in m().write.call_args_list)
@@ -188,6 +191,9 @@ class VvEmissionTests(unittest.TestCase):
         self.assertIn("password=PW:PVEVNC:rest", written)
         self.assertIn("type=vnc", written)
         self.assertIn("host=127.0.0.1", written)
+        # The Popen-OSError cleanup branch closed the listener and websocket.
+        self.assertIn("listener", closes)
+        ws_sock.close.assert_called_once_with()
 
 
 class BridgeSetupTests(unittest.TestCase):
@@ -195,12 +201,17 @@ class BridgeSetupTests(unittest.TestCase):
 
     # Value: protects=TCP_NODELAY is pinned on the accepted socket, fragmented server messages are reassembled before forwarding, stray continuations kill the session instead of corrupting the stream, and a viewer that dies pre-connect cannot hang the launcher; fails_when=a refactor drops the option, forwards fragments raw, or accepts forever; why_new=these setup behaviors had no coverage; seam=none (ws_connect/Popen/sockets mocked); no_claim=no real TLS, PVE, or viewer behavior
 
+    def setUp(self):
+        # bridge_and_launch's finally arms the teardown flag; a leaked value
+        # would make the signal-handler test order-dependent.
+        pc._SHUTDOWN_STATE["tearing_down"] = False
+
     def _run_bridge(self, tcp, accept_fn, reader, viewer=None, recv=None):
         # recv: optional list driving tcp_to_ws (defaults to dying at once).
         tcp.recv.side_effect = recv if recv is not None else OSError("stop")
         if viewer is None:
             viewer = mock.Mock()
-        viewer.poll.return_value = None  # alive: accept-loop liveness checks
+            viewer.poll.return_value = None  # alive for the accept-loop check
         viewer.wait.return_value = 0
         with mock.patch.object(pc, "ws_connect", return_value=(mock.Mock(), b"")), \
                 mock.patch.object(pc, "WsReader", return_value=reader), \
@@ -357,16 +368,8 @@ class BridgeSetupTests(unittest.TestCase):
         def accept():
             raise OSError(errno.EINVAL, "broken listener")
 
-        with mock.patch.object(pc, "ws_connect", return_value=(mock.Mock(), b"")), \
-                mock.patch.object(pc, "WsReader", return_value=reader), \
-                mock.patch.object(pc.socket, "socket", return_value=self._listener(accept)), \
-                mock.patch.object(pc.subprocess, "Popen", return_value=viewer), \
-                mock.patch("builtins.open", mock.mock_open()):
-            args = mock.Mock(host="h", node="n", vmid=101, viewer=None,
-                             validate_cert=True)
-            with self.assertRaises(OSError):
-                pc.bridge_and_launch({"port": "5900",
-                                      "ticket": "PW:PVEVNC:rest"}, "cookie", args)
+        with self.assertRaises(OSError):
+            self._run_bridge(mock.Mock(), accept, reader, viewer=viewer)
         viewer.terminate.assert_called_once_with()
 
     def test_unfragmented_data_messages_relayed_to_viewer(self):
@@ -507,17 +510,9 @@ class BridgeSetupTests(unittest.TestCase):
         def accept():
             raise OSError(errno.ECONNABORTED, "connection aborted")
 
-        with mock.patch.object(pc, "ws_connect", return_value=(mock.Mock(), b"")), \
-                mock.patch.object(pc, "WsReader", return_value=reader), \
-                mock.patch.object(pc.socket, "socket", return_value=self._listener(accept)), \
-                mock.patch.object(pc.subprocess, "Popen", return_value=viewer), \
-                mock.patch("builtins.open", mock.mock_open()), \
-                mock.patch.object(pc.time, "sleep"):
-            args = mock.Mock(host="h", node="n", vmid=101, viewer=None,
-                             validate_cert=True)
-            with self.assertRaises(RuntimeError) as ctx:
-                pc.bridge_and_launch({"port": "5900",
-                                      "ticket": "PW:PVEVNC:rest"}, "cookie", args)
+        with mock.patch.object(pc.time, "sleep"), \
+                self.assertRaises(RuntimeError) as ctx:
+            self._run_bridge(mock.Mock(), accept, reader, viewer=viewer)
         self.assertIn("without connecting", str(ctx.exception))
 
     def test_systemexit_during_wait_terminates_viewer(self):
@@ -530,21 +525,15 @@ class BridgeSetupTests(unittest.TestCase):
         reader = mock.Mock()
         reader.frame.side_effect = EOFError
         tcp = mock.Mock()
-        tcp.recv.side_effect = OSError("stop")
         viewer = mock.Mock()
         viewer.wait.side_effect = SystemExit(143)
-        with mock.patch.object(pc, "ws_connect", return_value=(mock.Mock(), b"")), \
-                mock.patch.object(pc, "WsReader", return_value=reader), \
-                mock.patch.object(pc.socket, "socket", return_value=self._listener(lambda: (tcp, ("127.0.0.1", 1)))), \
-                mock.patch.object(pc.subprocess, "Popen", return_value=viewer), \
-                mock.patch("builtins.open", mock.mock_open()):
-            args = mock.Mock(host="h", node="n", vmid=101, viewer=None,
-                             validate_cert=True)
-            with self.assertRaises(SystemExit):
-                pc.bridge_and_launch({"port": "5900",
-                                      "ticket": "PW:PVEVNC:rest"}, "cookie", args)
+        with self.assertRaises(SystemExit):
+            self._run_bridge(tcp, lambda: (tcp, ("127.0.0.1", 1)), reader,
+                             viewer=viewer)
         viewer.terminate.assert_called_once_with()
         tcp.shutdown.assert_called()
+        # The finally must arm the teardown guard that ignores repeat signals.
+        self.assertTrue(pc._SHUTDOWN_STATE["tearing_down"])
 
     def test_viewer_death_during_accept_raises(self):
         reader = mock.Mock()
@@ -555,16 +544,8 @@ class BridgeSetupTests(unittest.TestCase):
         def accept():
             raise socket.timeout()
 
-        with mock.patch.object(pc, "ws_connect", return_value=(mock.Mock(), b"")), \
-                mock.patch.object(pc, "WsReader", return_value=reader), \
-                mock.patch.object(pc.socket, "socket", return_value=self._listener(accept)), \
-                mock.patch.object(pc.subprocess, "Popen", return_value=viewer), \
-                mock.patch("builtins.open", mock.mock_open()):
-            args = mock.Mock(host="h", node="n", vmid=101, viewer=None,
-                             validate_cert=True)
-            with self.assertRaises(RuntimeError) as ctx:
-                pc.bridge_and_launch({"port": "5900",
-                                      "ticket": "PW:PVEVNC:rest"}, "cookie", args)
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run_bridge(mock.Mock(), accept, reader, viewer=viewer)
         self.assertIn("without connecting", str(ctx.exception))
         viewer.terminate.assert_called_once_with()
 
@@ -817,14 +798,22 @@ class ArgTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertEqual(err.getvalue(), "error: refused\n")
 
-    def test_node_with_crlf_rejected(self):
+    def test_node_charset_boundaries(self):
         # Regression: pre-landing review — --node was interpolated raw into
         # the HTTP request line; CRLF could smuggle headers into the upgrade.
         # Found by /ship security specialist on 2026-11-13
         # Report: .gstack/qa-reports/run-20261113T205424Z
-        # Value: protects=the node name is DNS-label shaped before it reaches ssh or the request line; fails_when=CRLF or shell metacharacters pass through; why_new=mint shlex.quoted the ssh path but the request line stayed unvalidated; seam=none; no_claim=none beyond protects
-        with self.assertRaises(SystemExit):
-            pc.main(["--host", "h", "--node", "a\r\nX-Evil: 1", "--vmid", "1"])
+        # Value: protects=the node name is DNS-label shaped before it reaches ssh or the request line; fails_when=CRLF, shell metacharacters, empty, unicode, or over-long names pass through; why_new=mint shlex.quoted the ssh path but the request line stayed unvalidated; seam=none; no_claim=none beyond protects
+        for node in ("pve", "a" * 63):  # accepted shapes
+            with mock.patch.object(pc, "mint",
+                                   side_effect=ValueError("stop-here")), \
+                    mock.patch.object(pc.signal, "signal"), \
+                    self.assertRaises(ValueError):
+                pc.main(["--host", "h", "--node", node, "--vmid", "1"])
+        for node in ("", ".pve", "-pve", "a" * 64, "nøde", "a b",
+                     "a\r\nX-Evil: 1"):
+            with self.assertRaises(SystemExit):
+                pc.main(["--host", "h", "--node", node, "--vmid", "1"])
 
     def test_signal_during_teardown_is_ignored(self):
         # Regression: pre-landing review — a second signal while the teardown

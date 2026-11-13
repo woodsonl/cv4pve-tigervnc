@@ -591,7 +591,9 @@ def main(argv):
     finally:
         # A signal (SystemExit from the handler) must not orphan the running
         # viewer with a dead bridge socket: stop it before the password file
-        # goes away. On the normal path wait() already reaped it.
+        # goes away. On the normal path wait() already reaped it. Further
+        # signals are ignored so the cleanup tail cannot be abandoned halfway.
+        _SHUTDOWN_STATE["tearing_down"] = True
         if proc is not None and proc.poll() is None:
             with contextlib.suppress(OSError):
                 proc.terminate()
@@ -603,12 +605,18 @@ def main(argv):
             sys.stderr.write(f"warning: could not delete password file: {exc}\n")
 
 
+_SHUTDOWN_STATE = {"tearing_down": False}
+
+
 def _install_sigterm_handler():
     # Default SIGTERM/SIGINT kill without running finally blocks (SIGINT's
     # KeyboardInterrupt does run them, but dies on a raw traceback); turn both
     # into an exception so the password file cleanup runs and the exit code is
-    # the conventional 128+N.
+    # the conventional 128+N. A repeat signal while the finally is running is
+    # ignored so it cannot abandon the unlink halfway.
     def handler(signum, _frame):
+        if _SHUTDOWN_STATE["tearing_down"]:
+            return
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, handler)

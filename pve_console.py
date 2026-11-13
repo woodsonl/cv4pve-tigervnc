@@ -46,6 +46,11 @@ import urllib.parse
 # producer and the parser enforce it so the echo path cannot become a
 # protocol violator.
 _WS_CONTROL_MAX = 125
+# One frame is capped at 16 MiB; a fragmented message has no frame-level
+# bound, so reassembly is capped separately at _WS_MAX_MESSAGE_BYTES.
+_WS_FRAME_MAX_BYTES = 16 * 1024 * 1024
+_WS_OP_CONT, _WS_OP_TEXT, _WS_OP_BINARY = 0x0, 0x1, 0x2
+_WS_OP_CLOSE, _WS_OP_PING, _WS_OP_PONG = 0x8, 0x9, 0xA
 
 
 # --------------------------------------------------------------------------
@@ -59,7 +64,7 @@ def _disable_nagle(sock):
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
 
-def ws_send_frame(sock, payload, opcode=2):
+def ws_send_frame(sock, payload, opcode=_WS_OP_BINARY):
     """Send one client frame; client frames are always masked."""
     mask = os.urandom(4)
     n = len(payload)
@@ -78,7 +83,9 @@ class WsReader:
 
     def __init__(self, sock, initial=b""):
         self.sock = sock
-        self.buf = initial
+        # bytearray: += extends in place; immutable bytes re-copied the whole
+        # accumulated buffer per ~16 KiB TLS record (quadratic per frame).
+        self.buf = bytearray(initial)
 
     def _need(self, n):
         while len(self.buf) < n:
@@ -96,7 +103,8 @@ class WsReader:
         if b2 & 0x80:
             raise ValueError("server frames must not be masked")
         opcode = b1 & 0x0F
-        if opcode not in (0, 1, 2, 8, 9, 10):
+        if opcode not in (_WS_OP_CONT, _WS_OP_TEXT, _WS_OP_BINARY,
+                          _WS_OP_CLOSE, _WS_OP_PING, _WS_OP_PONG):
             raise ValueError(f"unexpected websocket opcode {opcode}")
         if opcode >= 8 and not (b1 & 0x80):
             raise ValueError(f"fragmented control frame (opcode {opcode})")
@@ -110,13 +118,13 @@ class WsReader:
             self._need(10)
             n = struct.unpack(">Q", self.buf[2:10])[0]
             off = 10
-        if n > 16 * 1024 * 1024:
+        if n > _WS_FRAME_MAX_BYTES:
             raise ValueError(f"oversized websocket frame: {n}")
         if opcode >= 8 and n > _WS_CONTROL_MAX:
             raise ValueError(f"control frame payload {n} exceeds {_WS_CONTROL_MAX} bytes")
         self._need(off + n)
-        payload = self.buf[off:off + n]
-        self.buf = self.buf[off + n:]
+        payload = bytes(self.buf[off:off + n])
+        del self.buf[:off + n]  # drop the consumed prefix without re-copying it
         return fin, opcode, payload
 
 
@@ -126,10 +134,11 @@ class WsReader:
 
 _WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
-# One frame is capped at 16 MiB, but a fragmented message has no frame-level
-# bound; this caps reassembly so a hostile server cannot grow the buffer
-# without limit.
+# A fragmented message has no frame-level bound (frames stop at
+# _WS_FRAME_MAX_BYTES); this caps reassembly so a hostile server cannot grow
+# the buffer without limit.
 _WS_MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+
 
 
 def expected_ws_accept(key):
@@ -229,7 +238,10 @@ def ws_connect(host, port, node, vmid, vnc, api_ticket, validate_cert):
     head, _, rest = buf.partition(b"\r\n\r\n")
     status = head.split(b"\r\n")[0].decode("latin-1")
     if " 101 " not in status:
-        raise RuntimeError(f"websocket upgrade refused: {status}")
+        # Server-controlled bytes: strip anything that is not printable ASCII
+        # (terminal escapes could spoof diagnostics) before it hits stderr.
+        clean = "".join(c if 0x20 <= ord(c) < 0x7F else "?" for c in status)[:120]
+        raise RuntimeError(f"websocket upgrade refused: {clean}")
     accept = None
     for line in head.split(b"\r\n")[1:]:
         name, _, value = line.partition(b":")
@@ -286,21 +298,18 @@ def bridge_and_launch(vnc, api_ticket, args):
         while tcp is None:
             try:
                 tcp, _ = listener.accept()
+                continue  # connected: skip the liveness check below
             except socket.timeout:
-                if viewer.poll() is not None:
-                    raise RuntimeError(
-                        "viewer exited without connecting to the console bridge"
-                    ) from None
+                pass
             except OSError as exc:
                 if exc.errno != errno.ECONNABORTED:
                     raise
-                # A sustained abort flood must not spin the loop or hide a
-                # dead viewer: back off briefly and keep checking it.
-                if viewer.poll() is not None:
-                    raise RuntimeError(
-                        "viewer exited without connecting to the console bridge"
-                    ) from None
+                # A sustained abort flood must not spin the loop: back off.
                 time.sleep(0.1)
+            if viewer.poll() is not None:
+                raise RuntimeError(
+                    "viewer exited without connecting to the console bridge"
+                ) from None
         listener.settimeout(None)
         _disable_nagle(tcp)
         tcp.settimeout(None)
@@ -315,14 +324,14 @@ def bridge_and_launch(vnc, api_ticket, args):
                 frag = bytearray()
                 while True:
                     fin, opcode, payload = reader.frame()
-                    if opcode == 8:
+                    if opcode == _WS_OP_CLOSE:
                         break
-                    if opcode == 9:
-                        ws_send(payload, 0xA)
+                    if opcode == _WS_OP_PING:
+                        ws_send(payload, _WS_OP_PONG)
                         continue
-                    if opcode == 10:
+                    if opcode == _WS_OP_PONG:
                         continue
-                    if opcode in (1, 2):
+                    if opcode in (_WS_OP_TEXT, _WS_OP_BINARY):
                         if frag_op is not None:
                             # RFC 6455 5.4: only control frames may interleave
                             # with a fragmented message; accepting a complete
@@ -332,7 +341,7 @@ def bridge_and_launch(vnc, api_ticket, args):
                         if not fin:
                             frag_op, frag = opcode, bytearray(payload)
                             continue
-                    elif opcode == 0:
+                    elif opcode == _WS_OP_CONT:
                         if frag_op is None:
                             raise ValueError(
                                 "continuation frame without a started message")
@@ -373,11 +382,11 @@ def bridge_and_launch(vnc, api_ticket, args):
                 pass
             finally:
                 with contextlib.suppress(OSError):
-                    ws_send(b"", 8)
+                    ws_send(b"", _WS_OP_CLOSE)
 
         ws_lock = threading.Lock()
 
-        def ws_send(data, opcode=2):
+        def ws_send(data, opcode=_WS_OP_BINARY):
             with ws_lock:
                 ws_send_frame(sock, data, opcode)
 
