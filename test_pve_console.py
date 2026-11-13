@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Tests for pve_console.py: frame codec round-trips, .vv emission,
-argument handling. No network, no viewer, no PVE."""
+"""Tests for pve_console.py: frame codec round-trips, .vv emission, bridge
+setup/pump behavior (reassembly, accept loop, protocol violations), ws_connect
+TLS wiring, the mint error contract, and argument handling. No network, no
+viewer, no PVE."""
 
 import base64
 import errno
@@ -198,6 +200,7 @@ class BridgeSetupTests(unittest.TestCase):
         tcp.recv.side_effect = recv if recv is not None else OSError("stop")
         if viewer is None:
             viewer = mock.Mock()
+        viewer.poll.return_value = None  # alive: accept-loop liveness checks
         viewer.wait.return_value = 0
         with mock.patch.object(pc, "ws_connect", return_value=(mock.Mock(), b"")), \
                 mock.patch.object(pc, "WsReader", return_value=reader), \
@@ -472,6 +475,77 @@ class BridgeSetupTests(unittest.TestCase):
         self.assertIn("RSV", err.getvalue())
         tcp.sendall.assert_not_called()
 
+    def test_interleaved_data_frame_during_reassembly_rejected(self):
+        # Regression: pre-landing review — a complete data frame interleaved
+        # into a fragmented message was forwarded before the reassembled one,
+        # reordering server bytes on an RFB stream.
+        # Found by /ship red-team review on 2026-11-13
+        # Report: .gstack/qa-reports/run-20261113T205424Z
+        # Value: protects=RFC 6455 5.4's no-interleaving rule is enforced for complete data frames too; fails_when=fin=1 data frames fall through mid-reassembly and reorder the stream; why_new=only the new-fragment case was rejected; seam=none; no_claim=none beyond protects
+        reader = mock.Mock()
+        reader.frame.side_effect = [
+            (False, 2, b"A"),
+            (True, 2, b"B"),
+            EOFError,
+        ]
+        tcp = mock.Mock()
+        tcp, _ = self._run_bridge(tcp, lambda: (tcp, ("127.0.0.1", 1)), reader)
+        self.assertTrue(self._settle(lambda: tcp.shutdown.call_args_list))
+        tcp.sendall.assert_not_called()
+
+    def test_econnaborted_storm_detects_dead_viewer(self):
+        # Regression: pre-landing review — the ECONNABORTED branch never
+        # polled the viewer, so a dead viewer spun the loop forever.
+        # Found by /ship red-team review on 2026-11-13
+        # Report: .gstack/qa-reports/run-20261113T205424Z
+        # Value: protects=the abort-retry path keeps checking viewer liveness; fails_when=viewer.poll() runs only in the timeout branch and a dead viewer pins the session; why_new=the retry loop was added without its own liveness check; seam=none; no_claim=none beyond protects
+        reader = mock.Mock()
+        reader.frame.side_effect = EOFError
+        viewer = mock.Mock()
+        viewer.poll.return_value = 0  # viewer already dead
+
+        def accept():
+            raise OSError(errno.ECONNABORTED, "connection aborted")
+
+        with mock.patch.object(pc, "ws_connect", return_value=(mock.Mock(), b"")), \
+                mock.patch.object(pc, "WsReader", return_value=reader), \
+                mock.patch.object(pc.socket, "socket", return_value=self._listener(accept)), \
+                mock.patch.object(pc.subprocess, "Popen", return_value=viewer), \
+                mock.patch("builtins.open", mock.mock_open()), \
+                mock.patch.object(pc.time, "sleep"):
+            args = mock.Mock(host="h", node="n", vmid=101, viewer=None,
+                             validate_cert=True)
+            with self.assertRaises(RuntimeError) as ctx:
+                pc.bridge_and_launch({"port": "5900",
+                                      "ticket": "PW:PVEVNC:rest"}, "cookie", args)
+        self.assertIn("without connecting", str(ctx.exception))
+
+    def test_systemexit_during_wait_terminates_viewer(self):
+        # Regression: pre-landing review — pve_console's own signal path (a
+        # SystemExit from viewer.wait) had no test proving the viewer is
+        # terminated and teardown runs.
+        # Found by /ship specialist review on 2026-11-13
+        # Report: .gstack/qa-reports/run-20261113T205424Z
+        # Value: protects=SIGTERM/SIGINT during the session terminates the viewer and tears the bridge down; fails_when=SystemExit skips the except BaseException path; why_new=the wrapper got this test but the launcher did not; seam=none; no_claim=no real signal delivery
+        reader = mock.Mock()
+        reader.frame.side_effect = EOFError
+        tcp = mock.Mock()
+        tcp.recv.side_effect = OSError("stop")
+        viewer = mock.Mock()
+        viewer.wait.side_effect = SystemExit(143)
+        with mock.patch.object(pc, "ws_connect", return_value=(mock.Mock(), b"")), \
+                mock.patch.object(pc, "WsReader", return_value=reader), \
+                mock.patch.object(pc.socket, "socket", return_value=self._listener(lambda: (tcp, ("127.0.0.1", 1)))), \
+                mock.patch.object(pc.subprocess, "Popen", return_value=viewer), \
+                mock.patch("builtins.open", mock.mock_open()):
+            args = mock.Mock(host="h", node="n", vmid=101, viewer=None,
+                             validate_cert=True)
+            with self.assertRaises(SystemExit):
+                pc.bridge_and_launch({"port": "5900",
+                                      "ticket": "PW:PVEVNC:rest"}, "cookie", args)
+        viewer.terminate.assert_called_once_with()
+        tcp.shutdown.assert_called()
+
     def test_viewer_death_during_accept_raises(self):
         reader = mock.Mock()
         reader.frame.side_effect = EOFError
@@ -560,6 +634,35 @@ class WsConnectTests(unittest.TestCase):
         self.assertIs(ctx.check_hostname, True)
         self.assertEqual(err.getvalue(), "")
 
+    # Regression: pre-landing review — cert failures and other handshake
+    # failures must not share one message that coaches users into --insecure.
+    # Found by /ship red-team review on 2026-11-13
+    # Report: .gstack/qa-reports/run-20261113T205424Z
+    # Value: protects=only certificate failures suggest --insecure; a downgrade or cipher failure gets a neutral message; fails_when=any SSLError recommends disabling validation (an active MITM could be the cause); why_new=the translation branch had zero coverage and conflated both classes; seam=none; no_claim=no real TLS handshake
+    def test_cert_failure_suggests_insecure(self):
+        raw, ctx = mock.Mock(), mock.Mock()
+        ctx.wrap_socket.side_effect = ssl.SSLCertVerificationError(
+            1, "[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed")
+        with mock.patch.object(pc.socket, "create_connection", return_value=raw), \
+                mock.patch.object(pc.ssl, "create_default_context", return_value=ctx), \
+                self.assertRaises(RuntimeError) as caught:
+            pc.ws_connect("h", 8006, "n", 1, {"port": "5900", "ticket": "T"},
+                          "cookie", validate_cert=True)
+        self.assertIn("--insecure", str(caught.exception))
+        self.assertNotIsInstance(caught.exception, ssl.SSLError)
+
+    def test_other_tls_failure_does_not_suggest_insecure(self):
+        raw, ctx = mock.Mock(), mock.Mock()
+        ctx.wrap_socket.side_effect = ssl.SSLError(
+            1, "[SSL: WRONG_VERSION_NUMBER] wrong version number")
+        with mock.patch.object(pc.socket, "create_connection", return_value=raw), \
+                mock.patch.object(pc.ssl, "create_default_context", return_value=ctx), \
+                self.assertRaises(RuntimeError) as caught:
+            pc.ws_connect("h", 8006, "n", 1, {"port": "5900", "ticket": "T"},
+                          "cookie", validate_cert=True)
+        self.assertNotIn("--insecure", str(caught.exception))
+        self.assertIn("TLS handshake", str(caught.exception))
+
 
 class MintTests(unittest.TestCase):
     # Value: protects=the one-time VNC ticket never reaches stderr/logs on the mint failure path and missing pvesh keys fail with a diagnostic instead of a bare KeyError; fails_when=pvesh JSON is echoed or a missing key escapes unhandled; why_new=the failure path previously echoed ticket-bearing JSON; seam=none (ssh mocked); no_claim=no real ssh/pvesh behavior
@@ -620,6 +723,34 @@ class MintTests(unittest.TestCase):
         self.assertIn("non-JSON", str(ctx.exception))
         self.assertNotIn("SECRETONE", str(ctx.exception))
 
+    # Regression: pre-landing review — a valid-JSON non-object pvesh body
+    # raised AttributeError past the one-line error contract.
+    # Found by /ship specialist review on 2026-11-13
+    # Report: .gstack/qa-reports/run-20261113T205424Z
+    # Value: protects=a non-object JSON body surfaces as a one-line RuntimeError; fails_when=vnc.get is called on a list/scalar; why_new=MintTests only covered dict bodies; seam=none; no_claim=none beyond protects
+    def test_non_dict_json_translates_to_runtime_error(self):
+        for body in (b'[1,2]\nPVE:apiticket', b'"ok"\nPVE:apiticket',
+                     b'null\nPVE:apiticket'):
+            with mock.patch.object(pc.subprocess, "check_output",
+                                   return_value=body), \
+                    self.assertRaises(RuntimeError) as ctx:
+                pc.mint("h", "n", "1")
+            self.assertIn("unexpected JSON", str(ctx.exception))
+            self.assertNotIn("apiticket", str(ctx.exception))
+
+    # Regression: pre-landing review — non-UTF-8 ssh output raised
+    # UnicodeDecodeError past the one-line error contract.
+    # Found by /ship red-team review on 2026-11-13
+    # Report: .gstack/qa-reports/run-20261113T205424Z
+    # Value: protects=undecodable ssh output surfaces as a one-line RuntimeError; fails_when=UnicodeDecodeError escapes mint; why_new=every other mint failure mode was covered but this one; seam=none; no_claim=none beyond protects
+    def test_non_utf8_output_translates_to_runtime_error(self):
+        with mock.patch.object(pc.subprocess, "check_output",
+                               return_value=b"\xff\xfe junk\nPVE:apiticket"), \
+                self.assertRaises(RuntimeError) as ctx:
+            pc.mint("h", "n", "1")
+        self.assertIn("non-UTF-8", str(ctx.exception))
+        self.assertNotIn("apiticket", str(ctx.exception))
+
 
 class ArgTests(unittest.TestCase):
     def test_missing_required_argument_exits(self):
@@ -646,16 +777,8 @@ class ArgTests(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertEqual(err.getvalue(), "error: boom\n")
 
-    def test_validate_cert_alias_still_accepted(self):
-        # Value: protects=the removed --validate-cert flag stays a silent no-op so persisted invocations keep working; fails_when=argparse rejects the old flag with exit 2 before any diagnostic; why_new=the flag's meaning equals the new default; seam=none; no_claim=none beyond protects
-        with mock.patch.object(pc, "mint", side_effect=ValueError("stop-here")), \
-                mock.patch.object(pc.signal, "signal"), \
-                self.assertRaises(ValueError):
-            pc.main(["--host", "h", "--node", "n", "--vmid", "1",
-                     "--validate-cert"])
-
     def test_insecure_flag_skips_cert_validation(self):
-        # Value: protects=--insecure reaches the websocket as validate_cert=False, even combined with the legacy --validate-cert alias; fails_when=the flag wiring drops and self-signed hosts cannot connect at all; why_new=the PR's headline flag had no wiring test; seam=none (mint/bridge_and_launch mocked); no_claim=none beyond protects
+        # Value: protects=--insecure reaches the websocket as validate_cert=False; fails_when=the flag wiring drops and self-signed hosts cannot connect at all; why_new=the PR's headline flag had no wiring test; seam=none (mint/bridge_and_launch mocked); no_claim=none beyond protects
         br = mock.Mock(return_value=0)
         with mock.patch.object(pc, "mint",
                                return_value=({"port": "5900", "ticket": "T"},
@@ -663,7 +786,7 @@ class ArgTests(unittest.TestCase):
                 mock.patch.object(pc, "bridge_and_launch", br), \
                 mock.patch.object(pc.signal, "signal"):
             rc = pc.main(["--host", "h", "--node", "n", "--vmid", "1",
-                          "--insecure", "--validate-cert"])
+                          "--insecure"])
         self.assertEqual(rc, 0)
         self.assertIs(br.call_args.args[2].validate_cert, False)
 
@@ -693,6 +816,32 @@ class ArgTests(unittest.TestCase):
             rc = pc.main(["--host", "h", "--node", "n", "--vmid", "1"])
         self.assertEqual(rc, 2)
         self.assertEqual(err.getvalue(), "error: refused\n")
+
+    def test_node_with_crlf_rejected(self):
+        # Regression: pre-landing review — --node was interpolated raw into
+        # the HTTP request line; CRLF could smuggle headers into the upgrade.
+        # Found by /ship security specialist on 2026-11-13
+        # Report: .gstack/qa-reports/run-20261113T205424Z
+        # Value: protects=the node name is DNS-label shaped before it reaches ssh or the request line; fails_when=CRLF or shell metacharacters pass through; why_new=mint shlex.quoted the ssh path but the request line stayed unvalidated; seam=none; no_claim=none beyond protects
+        with self.assertRaises(SystemExit):
+            pc.main(["--host", "h", "--node", "a\r\nX-Evil: 1", "--vmid", "1"])
+
+    def test_signal_during_teardown_is_ignored(self):
+        # Regression: pre-landing review — a second signal while the teardown
+        # finally ran raised SystemExit from the handler and abandoned the
+        # cleanup tail (the .vv unlink).
+        # Found by /ship red-team review on 2026-11-13
+        # Report: .gstack/qa-reports/run-20261113T205424Z
+        # Value: protects=repeat TERM/Ctrl-C cannot abort the .vv cleanup halfway; fails_when=the handler raises unconditionally during teardown; why_new=the ticket-bearing .vv could survive on disk; seam=none; no_claim=no real signal delivery
+        with self.assertRaises(SystemExit) as first:
+            pc._on_signal(15, None)
+        self.assertEqual(first.exception.code, 143)
+        old = pc._SHUTDOWN_STATE["tearing_down"]
+        pc._SHUTDOWN_STATE["tearing_down"] = True
+        try:
+            pc._on_signal(15, None)  # must not raise
+        finally:
+            pc._SHUTDOWN_STATE["tearing_down"] = old
 
 
 if __name__ == "__main__":

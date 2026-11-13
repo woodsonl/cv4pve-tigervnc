@@ -27,6 +27,7 @@ import base64
 import errno
 import hashlib
 import json
+import re
 import shlex
 import os
 import signal
@@ -38,9 +39,13 @@ import sys
 import contextlib
 import tempfile
 import threading
+import time
 import urllib.parse
 
-DEFAULT_VIEWER = "/Applications/TigerVNC.app/Contents/MacOS/vncviewer"
+# RFC 6455: control frame payloads are capped at 125 bytes. Both the pong
+# producer and the parser enforce it so the echo path cannot become a
+# protocol violator.
+_WS_CONTROL_MAX = 125
 
 
 # --------------------------------------------------------------------------
@@ -48,11 +53,17 @@ DEFAULT_VIEWER = "/Applications/TigerVNC.app/Contents/MacOS/vncviewer"
 # --------------------------------------------------------------------------
 
 
+def _disable_nagle(sock):
+    # Interactive traffic (viewer input events) must not sit in Nagle's
+    # buffer waiting for an ACK; framebuffer bulk is unaffected.
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+
 def ws_send_frame(sock, payload, opcode=2):
     """Send one client frame; client frames are always masked."""
     mask = os.urandom(4)
     n = len(payload)
-    if n <= 125:
+    if n <= _WS_CONTROL_MAX:
         header = bytes([0x80 | opcode, 0x80 | n])
     elif n <= 0xFFFF:
         header = bytes([0x80 | opcode, 0x80 | 126]) + struct.pack(">H", n)
@@ -101,8 +112,8 @@ class WsReader:
             off = 10
         if n > 16 * 1024 * 1024:
             raise ValueError(f"oversized websocket frame: {n}")
-        if opcode >= 8 and n > 125:
-            raise ValueError(f"control frame payload {n} exceeds 125 bytes")
+        if opcode >= 8 and n > _WS_CONTROL_MAX:
+            raise ValueError(f"control frame payload {n} exceeds {_WS_CONTROL_MAX} bytes")
         self._need(off + n)
         payload = self.buf[off:off + n]
         self.buf = self.buf[off + n:]
@@ -142,6 +153,10 @@ def mint(host, node, vmid):
         raise RuntimeError(f"could not reach {host} over ssh to mint the ticket") from None
     except subprocess.TimeoutExpired:
         raise RuntimeError(f"ssh to {host} timed out minting the ticket") from None
+    except UnicodeDecodeError:
+        # Root banners or locale noise can carry non-UTF-8 bytes; the JSON and
+        # ticket line are ASCII, so anything undecodable is junk around them.
+        raise RuntimeError(f"ssh to {host} produced non-UTF-8 output") from None
     idx = out.find("\nPVE:")
     if idx < 0:
         # pvesh's JSON body contains the one-time ticket; echo nothing from it.
@@ -152,6 +167,8 @@ def mint(host, node, vmid):
         # The ticket line without valid JSON means pvesh changed or broke; the
         # body may hold the ticket, so echo nothing.
         raise RuntimeError(f"pvesh on {host} returned a non-JSON ticket response") from None
+    if not isinstance(vnc, dict):
+        raise RuntimeError(f"pvesh on {host} returned unexpected JSON")
     missing = [k for k in ("port", "ticket") if not vnc.get(k)]
     if missing:
         raise RuntimeError(f"pvesh response is missing {', '.join(missing)}")
@@ -160,9 +177,7 @@ def mint(host, node, vmid):
 
 def ws_connect(host, port, node, vmid, vnc, api_ticket, validate_cert):
     raw = socket.create_connection((host, port), timeout=10)
-    # Interactive traffic (viewer input events) must not sit in Nagle's
-    # buffer waiting for an ACK; framebuffer bulk is unaffected.
-    raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    _disable_nagle(raw)
     ctx = ssl.create_default_context()
     if validate_cert:
         ctx.verify_mode = ssl.CERT_REQUIRED
@@ -178,10 +193,15 @@ def ws_connect(host, port, node, vmid, vnc, api_ticket, validate_cert):
               "is sent unvalidated (--insecure)", file=sys.stderr)
     try:
         sock = ctx.wrap_socket(raw, server_hostname=host)
-    except ssl.SSLError:
+    except ssl.SSLCertVerificationError:
         raise RuntimeError(
             f"TLS certificate validation failed for {host}; pass --insecure "
             "if the host uses a self-signed certificate") from None
+    except ssl.SSLError as exc:
+        # A non-certificate handshake failure (downgrade, cipher mismatch, a
+        # plain-HTTP port) must not coach the user into disabling validation;
+        # an active MITM could be the cause.
+        raise RuntimeError(f"TLS handshake with {host} failed: {exc}") from None
     key = base64.b64encode(os.urandom(16)).decode()
     q = urllib.parse.urlencode({"port": vnc["port"], "vncticket": vnc["ticket"]})
     request = (
@@ -274,10 +294,15 @@ def bridge_and_launch(vnc, api_ticket, args):
             except OSError as exc:
                 if exc.errno != errno.ECONNABORTED:
                     raise
+                # A sustained abort flood must not spin the loop or hide a
+                # dead viewer: back off briefly and keep checking it.
+                if viewer.poll() is not None:
+                    raise RuntimeError(
+                        "viewer exited without connecting to the console bridge"
+                    ) from None
+                time.sleep(0.1)
         listener.settimeout(None)
-        # Interactive traffic (viewer input events) must not sit in Nagle's
-        # buffer waiting for an ACK; framebuffer bulk is unaffected.
-        tcp.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        _disable_nagle(tcp)
         tcp.settimeout(None)
         print(f"console: VM {args.vmid} on 127.0.0.1:{local_port}", file=sys.stderr)
 
@@ -298,10 +323,13 @@ def bridge_and_launch(vnc, api_ticket, args):
                     if opcode == 10:
                         continue
                     if opcode in (1, 2):
+                        if frag_op is not None:
+                            # RFC 6455 5.4: only control frames may interleave
+                            # with a fragmented message; accepting a complete
+                            # data frame here would reorder server bytes.
+                            raise ValueError(
+                                "data frame during message reassembly")
                         if not fin:
-                            if frag_op is not None:
-                                raise ValueError(
-                                    "new fragmented message during reassembly")
                             frag_op, frag = opcode, bytearray(payload)
                             continue
                     elif opcode == 0:
@@ -368,6 +396,9 @@ def bridge_and_launch(vnc, api_ticket, args):
         # Teardown on every path: close the local socket first so the viewer
         # cannot be left painting a dead session, then the websocket.
         # shutdown before close so a pump parked in recv is reliably woken.
+        # Signals are ignored from here so a repeat TERM/Ctrl-C cannot abort
+        # the cleanup tail (the .vv unlink) halfway.
+        _SHUTDOWN_STATE["tearing_down"] = True
         if tcp is not None:
             with contextlib.suppress(OSError):
                 tcp.shutdown(socket.SHUT_RDWR)
@@ -381,10 +412,29 @@ def bridge_and_launch(vnc, api_ticket, args):
             os.rmdir(vv_dir)
 
 
+_SHUTDOWN_STATE = {"tearing_down": False}
+
+
+def _on_signal(signum, _frame):
+    # A second signal while the teardown finally runs must not abandon the
+    # remaining cleanup (the .vv unlink); ignore it instead.
+    if _SHUTDOWN_STATE["tearing_down"]:
+        return
+    raise SystemExit(128 + signum)
+
+
+def _node_name(value):
+    # PVE node names are DNS-label shaped; validating here keeps the value
+    # safe for both the ssh command and the HTTP request line.
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9.-]{0,62}", value):
+        raise argparse.ArgumentTypeError(f"invalid node name: {value!r}")
+    return value
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--host", required=True, help="PVE host address")
-    ap.add_argument("--node", required=True, help="cluster node name")
+    ap.add_argument("--node", required=True, type=_node_name, help="cluster node name")
     ap.add_argument("--vmid", required=True, type=int, help="VM id")
     ap.add_argument("--port", type=int, default=8006, help="pveproxy port")
     ap.add_argument("--viewer", default=None,
@@ -393,13 +443,10 @@ def main(argv=None):
                     help="skip TLS certificate validation for self-signed PVE "
                          "hosts; the root session cookie then rides an "
                          "unvalidated connection")
-    # Cert validation is the default now; the old opt-in flag means the same
-    # thing, so it is accepted as a silent no-op for existing invocations.
-    ap.add_argument("--validate-cert", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args(argv)
 
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
-    signal.signal(signal.SIGINT, lambda *_: sys.exit(130))
+    signal.signal(signal.SIGTERM, _on_signal)
+    signal.signal(signal.SIGINT, _on_signal)
 
     try:
         vnc, api_ticket = mint(args.host, args.node, args.vmid)
