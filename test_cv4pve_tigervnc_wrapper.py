@@ -685,7 +685,8 @@ class LaunchTests(unittest.TestCase):
         # Found by /ship maintainability review on 2026-11-13
         # Report: .gstack/qa-reports/run-20261113T205424Z
         # Value: protects=a repeat TERM/Ctrl-C cannot skip the password-file cleanup; fails_when=the wrapper handler raises while the teardown flag is set; why_new=the guard existed only in pve_console; seam=none; no_claim=no real signal delivery
-        old_handler = signal.getsignal(signal.SIGTERM)
+        old_handlers = (signal.getsignal(signal.SIGTERM),
+                        signal.getsignal(signal.SIGINT))
         old_flag = w._SHUTDOWN_STATE["tearing_down"]
         try:
             # Earlier in-process tests arm the flag in main's finally.
@@ -698,7 +699,8 @@ class LaunchTests(unittest.TestCase):
             w._SHUTDOWN_STATE["tearing_down"] = True
             handler(signal.SIGTERM, None)  # must not raise
         finally:
-            signal.signal(signal.SIGTERM, old_handler)
+            signal.signal(signal.SIGTERM, old_handlers[0])
+            signal.signal(signal.SIGINT, old_handlers[1])
             w._SHUTDOWN_STATE["tearing_down"] = old_flag
 
     def test_sigint_exits_130_and_cleans_passwd_file(self):
